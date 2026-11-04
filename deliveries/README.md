@@ -1,0 +1,18 @@
+# Custom 数据代码审查交付包
+
+- uploaded/：用户提供的元数据、代码缓存、顺序表、审计与归一化统计文件，内容保持原样，仅统一文件名。
+- generated/：本次生成的检查脚本、报告、JSON检查结果、图文对照脚本及测试产物。
+- MANIFEST.json：各文件长度与SHA256。
+
+优先阅读 generated/真实数据代码审查.md。
+图文对照：安装 av pandas pyarrow pillow 后运行 generated/render_code_video.py --help，root/audit/out由你指定。
+原始真实视频和帧Parquet未提供，因此包内没有真实数据集视频。
+
+注意：generated/synthetic/和generated/render-test/全部为合成测试数据，不能当作真实数据。synthetic/bad.pt是故意损坏的测试缓存，不能用于训练。
+generated/审查结论.md是收到真实附件前的初步报告；真实附件结果以generated/真实数据代码审查.md为准。
+generated/analyze_uploaded.py包含本次环境绝对路径，换机器需调整；check_cache.py和render_code_video.py使用命令行路径。
+generated/code_video_review_tool.zip是先前提供的独立工具包。
+
+本压缩包不包含Python虚拟环境、模型权重、Git元数据或编译缓存，不执行其中的代码标签。
+
+文件：custom-data-review.zip
