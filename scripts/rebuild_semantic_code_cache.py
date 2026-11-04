@@ -9,10 +9,30 @@ import ast
 from collections import Counter
 from copy import deepcopy
 import hashlib
+import io
 import json
 from pathlib import Path
+import tokenize
 
 import torch
+
+
+def without_comments(code):
+    """Remove Python COMMENT tokens, never '#' characters inside string literals."""
+    if not code:
+        return code
+    lines=code.splitlines(keepends=True)
+    for token in tokenize.generate_tokens(io.StringIO(code).readline):
+        if token.type!=tokenize.COMMENT:
+            continue
+        row,column=token.start
+        end=token.end[1]
+        prefix,suffix=lines[row-1][:column],lines[row-1][end:]
+        lines[row-1]=prefix.rstrip()+suffix if prefix.strip() else ''
+    cleaned=''.join(lines)
+    if ast.dump(ast.parse(code),include_attributes=False)!=ast.dump(ast.parse(cleaned),include_attributes=False):
+        raise AssertionError('Comment removal unexpectedly changed program semantics')
+    return cleaned
 
 
 def calls(code):
@@ -132,8 +152,13 @@ def rebuild(cache,order_path,audit_path,info_path,out,keep_retreat_episodes=()):
     if keep-{r['episode_index'] for r in records}:
         raise ValueError('Unknown keep-retreat episode IDs')
     rebuilt=[];changes=[]
+    comment_spans_cleaned=0
     for record in records:
         rec,delta=(deepcopy(record),[]) if record['episode_index'] in keep else merge_record(record)
+        for span in rec['spans']:
+            cleaned=without_comments(span['code'])
+            comment_spans_cleaned+=cleaned!=span['code']
+            span['code']=cleaned
         rebuilt.append(rec);changes.extend(delta)
     codes=[''];lookup={'':0};ids=[]
     before=Counter();after=Counter();tasks={}
@@ -154,6 +179,7 @@ def rebuild(cache,order_path,audit_path,info_path,out,keep_retreat_episodes=()):
     if any(before[k]!=after[k] for k in before if k!='move_arm'):
         raise AssertionError('Unexpected change to semantic calls')
     report=dict(version='release-place-retreat-v1',episodes=len(records),frames=len(ids),
+                generated_code_comments=False,comment_spans_cleaned=comment_spans_cleaned,
                 keep_retreat_episodes=sorted(keep),
                 merged_retreats=len(changes),removed_move_arm_calls=before['move_arm']-after['move_arm'],
                 calls_before=dict(before),calls_after=dict(after),by_task=tasks,changes=changes,

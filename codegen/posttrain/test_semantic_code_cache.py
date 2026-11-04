@@ -1,6 +1,8 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
+import tokenize
 
 import pytest
 import torch
@@ -75,3 +77,29 @@ def test_cache_rebuild_roundtrip_and_corrupt_input(tmp_path):
     torch.save(dict(codes=codes,code_id_by_idx=torch.tensor(ids)),cache)
     with pytest.raises(ValueError,match='Invalid global'):builder.rebuild(cache,order,audit,info,tmp_path/'bad')
     assert not (tmp_path/'bad').exists()
+
+
+def test_comment_removal_preserves_strings_and_arguments():
+    original=code('# turn knob',"robot.rotate('knob#1', 83.52, side='left') # measured angle",
+                  "return robot.release(side='left')")
+    cleaned=builder.without_comments(original)
+    assert "'knob#1'" in cleaned
+    assert builder.calls(cleaned)==builder.calls(original)
+    assert not any(t.type==tokenize.COMMENT for t in tokenize.generate_tokens(io.StringIO(cleaned).readline))
+
+
+def test_generated_cache_and_audit_have_no_comments(tmp_path):
+    r=record();r['spans'][0]['code']=code('# approach handle',"return robot.grasp('handle#1', side='left')")
+    codes=[s['code'] for s in r['spans']]
+    ids=[i for i,s in enumerate(r['spans']) for _ in range(s['end']-s['start'])]
+    paths=[tmp_path/name for name in ['source.pt','order.json','audit.jsonl','info.json']]
+    torch.save(dict(codes=codes,code_id_by_idx=torch.tensor(ids)),paths[0])
+    paths[1].write_text(json.dumps([dict(episode_index=0,task_index=0,offset=0,length=10)]))
+    paths[2].write_text(json.dumps(r)+'\n');paths[3].write_text(json.dumps(dict(total_frames=10,total_episodes=1)))
+    # Exception episodes keep their motion spans, but their code is still comment-free.
+    report=builder.rebuild(*paths,tmp_path/'out',keep_retreat_episodes=[0])
+    assert report['comment_spans_cleaned']==1
+    d=torch.load(tmp_path/'out/policy_code_idx_custom.pt',weights_only=True)
+    audit=json.loads((tmp_path/'out/gripper_code_audit.jsonl').read_text())
+    for c in d['codes']+[s['code'] for s in audit['spans']]:
+        assert not any(t.type==tokenize.COMMENT for t in tokenize.generate_tokens(io.StringIO(c).readline))
