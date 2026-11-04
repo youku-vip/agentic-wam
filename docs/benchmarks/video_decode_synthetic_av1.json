@@ -1,0 +1,100 @@
+{
+  "video": {
+    "path": "synthetic/av1_demo.mp4 (generated test fixture; not the user dataset)",
+    "codec": "av1",
+    "fps": 10.0,
+    "frames": 60,
+    "width": 424,
+    "height": 240
+  },
+  "backend": "torchcodec",
+  "ffmpeg_threads_per_decoder": 1,
+  "torch_cpu_threads": 1,
+  "warmup_windows": 2,
+  "random_seed": 42,
+  "selected_frames_per_window": 9,
+  "results": [
+    {
+      "case": "fresh_dense",
+      "requested_frames": 33,
+      "decoder_constructions_including_warmup": 18,
+      "windows": 16,
+      "decode_seconds_total": 0.7656479930010391,
+      "window_seconds_p50": 0.04789158999847132,
+      "window_seconds_p95": 0.0546398840015172,
+      "windows_per_second": 20.89733160180606,
+      "selected_frame_hash_matches": 16,
+      "selected_frame_hash_checks": 16,
+      "returned_float32_frame_bytes": 40296960,
+      "speedup_vs_fresh_dense": 1.0
+    },
+    {
+      "case": "fresh_sparse",
+      "requested_frames": 9,
+      "decoder_constructions_including_warmup": 18,
+      "windows": 16,
+      "decode_seconds_total": 0.39098503200511914,
+      "window_seconds_p50": 0.02408810750421253,
+      "window_seconds_p95": 0.030466574246020173,
+      "windows_per_second": 40.92228267140035,
+      "selected_frame_hash_matches": 16,
+      "selected_frame_hash_checks": 16,
+      "returned_float32_frame_bytes": 10990080,
+      "speedup_vs_fresh_dense": 1.9582539747736802
+    },
+    {
+      "case": "reuse_dense",
+      "requested_frames": 33,
+      "decoder_constructions_including_warmup": 1,
+      "windows": 16,
+      "decode_seconds_total": 0.7374101659806911,
+      "window_seconds_p50": 0.046111348496197024,
+      "window_seconds_p95": 0.048797213752550306,
+      "windows_per_second": 21.697558208627893,
+      "selected_frame_hash_matches": 16,
+      "selected_frame_hash_checks": 16,
+      "returned_float32_frame_bytes": 40296960,
+      "speedup_vs_fresh_dense": 1.038293243466198
+    },
+    {
+      "case": "reuse_sparse",
+      "requested_frames": 9,
+      "decoder_constructions_including_warmup": 1,
+      "windows": 16,
+      "decode_seconds_total": 0.35975684900040505,
+      "window_seconds_p50": 0.02262027200049488,
+      "window_seconds_p95": 0.02624399850174086,
+      "windows_per_second": 44.474483375247665,
+      "selected_frame_hash_matches": 16,
+      "selected_frame_hash_checks": 16,
+      "returned_float32_frame_bytes": 10990080,
+      "speedup_vs_fresh_dense": 2.128237433501029
+    }
+  ],
+  "all_selected_frames_identical": true,
+  "limits": [
+    "Single CPU process and one video file; retained decoder cases are an upper bound with 100% file-cache hits.",
+    "Times cover existing decode calls only; hashes are checked outside timing. No image transforms, text loads, H2D, model or communication.",
+    "Warmup favors a hot OS page cache. A random multi-worker/multi-file training loader may have different results.",
+    "Sparse output does not avoid all inter-frame/GOP decoding; do not infer 33/9 training speedup.",
+    "The benchmark uses the current round(timestamp*average_fps) and timestamp tolerance rules; it is not a timestamp convention change."
+  ],
+  "fixture": {
+    "synthetic": true,
+    "encoder": "libaom-av1",
+    "options": {
+      "cpu-used": "8",
+      "crf": "35",
+      "row-mt": "1"
+    },
+    "gop": 30,
+    "encoded_frames": 60,
+    "sha256": "2f0c437aea6a40360919f13f99a966f6e90e308215d076e7492647df86cfec2a"
+  },
+  "environment": {
+    "torch": "2.7.1+cu128",
+    "torchcodec": "0.5",
+    "av": "16.0.1",
+    "gpu_used": false
+  }
+}
