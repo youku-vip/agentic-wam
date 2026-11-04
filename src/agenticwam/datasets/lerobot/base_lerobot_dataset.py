@@ -1,4 +1,5 @@
 import torch
+import operator
 import numpy as np
 from pathlib import Path
 from typing import List, Literal, Dict, Optional, Any, DefaultDict
@@ -39,6 +40,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # sampling
         global_sample_stride: int = 1,
+        image_obs_indices: Optional[List[int]] = None,
+        video_backend: Optional[str] = None,
+        video_decoder_cache_size: int = 0,
+        video_decoder_num_threads: Optional[int] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -50,6 +55,11 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         self.action_size = action_size
         self.past_action_size = past_action_size
         self.obs_size = obs_size
+        self.image_obs_indices = (list(range(obs_size)) if image_obs_indices is None
+                                  else [operator.index(i) for i in image_obs_indices])
+        if (not self.image_obs_indices or self.image_obs_indices != sorted(set(self.image_obs_indices))
+                or self.image_obs_indices[0] < 0 or self.image_obs_indices[-1] >= obs_size):
+            raise ValueError("image_obs_indices must be sorted, unique indices within the observation window")
         self.processor = None  # Will be set externally
         metas = []
         for ds_dir in dataset_dirs:
@@ -76,7 +86,7 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             key = meta["key"]
             meta["lerobot_key"] = f"observation.images.{key}" if key != "default" else "observation.images"
             delta_timestamps[meta["lerobot_key"]] = [
-                (t * global_sample_stride) / fps for t in range(-past_obs_size, -past_obs_size + obs_size)
+                ((t - past_obs_size) * global_sample_stride) / fps for t in self.image_obs_indices
             ]
         
         for meta in self.state_meta:
@@ -128,6 +138,9 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             dataset_dirs=self.dataset_dirs,
             episodes=episodes,
             delta_timestamps=delta_timestamps,
+            video_backend=video_backend,
+            decoder_cache_size=video_decoder_cache_size,
+            decoder_num_threads=video_decoder_num_threads,
         )
         
         # HACK: lerobot 3.0 will fix this

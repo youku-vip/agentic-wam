@@ -1,0 +1,102 @@
+{
+  "passed": true,
+  "checked_samples": 9,
+  "failures": [],
+  "optimized_cache_last_snapshot_by_pid": {
+    "70188": {
+      "pid": 70188,
+      "size": 3,
+      "hits": 12,
+      "misses": 3,
+      "evictions": 0
+    },
+    "70189": {
+      "pid": 70189,
+      "size": 3,
+      "hits": 9,
+      "misses": 3,
+      "evictions": 0
+    }
+  },
+  "example_field_fingerprints": {
+    "video": {
+      "shape": [
+        3,
+        27,
+        24,
+        32
+      ],
+      "dtype": "torch.float32",
+      "sha256": "60c6c5cf16805bc2b9112ff74bdb4475c5f1a89662bb3cba6e11e47d8b508130"
+    },
+    "action": {
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "torch.float32",
+      "sha256": "32cca482b081b72d09d23f6239daed803b249263ed709ee377254190c17d9684"
+    },
+    "proprio": {
+      "shape": [
+        32,
+        64
+      ],
+      "dtype": "torch.float32",
+      "sha256": "ee8a99ad4a0320a3d7bf83de4be93a75102db6c485e14b8350fdc75a1c302918"
+    },
+    "prompt": {
+      "type": "str",
+      "sha256": "a967dbce4bbace1247759a3aebca71f01b89257c7bcdf31e1e118ac0d06cd899"
+    },
+    "image_is_pad": {
+      "shape": [
+        9
+      ],
+      "dtype": "torch.bool",
+      "sha256": "3e7077fd2f66d689e0cee6a7cf5b37bf2dca7c979af356d0a31cbc5c85605c7d"
+    },
+    "action_is_pad": {
+      "shape": [
+        32
+      ],
+      "dtype": "torch.bool",
+      "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+    },
+    "proprio_is_pad": {
+      "shape": [
+        33
+      ],
+      "dtype": "torch.bool",
+      "sha256": "7f9c9e31ac8256ca2f258583df262dbc7d6f68f2a03043d5c99a4ae5a7396ce9"
+    },
+    "prompt_embs": {
+      "shape": [
+        2,
+        4
+      ],
+      "dtype": "torch.float32",
+      "sha256": "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
+    },
+    "policy_code": {
+      "type": "str",
+      "sha256": "602db0a6fdd00fc4952f294a006938940ee3d172d687ca31aec85a4a87d0858e"
+    }
+  },
+  "episodes": [
+    0,
+    1,
+    2
+  ],
+  "workers": 2,
+  "cache_size": 8,
+  "notes": [
+    "Compares hashes of final model inputs, targets, masks, code/text and post-sample RNG states.",
+    "No input data, code cache, statistics or model weights are written.",
+    "workers=0 intentionally does not retain native decoders in the parent process.",
+    "This is a correctness check, not a throughput benchmark."
+  ],
+  "synthetic": true,
+  "gpu_used": false,
+  "limits": "Three synthetic v3 episodes, three shared MP4 streams, two CPU DataLoader workers; not the user dataset."
+}

@@ -180,8 +180,13 @@ class AgenticWAMTrainer:
         # cfg.max_grad_norm was silently ignored (accelerator.clip_grad_norm_ is only a norm GETTER under
         # DeepSpeed). Observed: clip=0 in DeepSpeed, grad norms 15-160 fed to AdamW unclipped.
         _dsp = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        self._ds_graph_count_cache = None
         if _dsp is not None:
             _dsp.deepspeed_config["gradient_clipping"] = float(self.max_grad_norm)
+            if os.environ.get("AGENTICWAM_CACHE_DS_GRAPH_COUNTS", "0") == "1":
+                from .utils.deepspeed_graph_count_cache import install_graph_count_cache
+                self._ds_graph_count_cache = install_graph_count_cache(
+                    _dsp.deepspeed_config.get("zero_optimization", {}).get("stage", 0))
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
         )
@@ -755,6 +760,7 @@ class AgenticWAMTrainer:
                 "num_workers_per_rank": self.num_workers, "mixed_precision": self.mixed_precision,
                 "phase_timing_env": os.environ.get("AGENTICWAM_PHASE_TIMING", "1"),
                 "mot_no_ckpt_every_env": os.environ.get("AGENTICWAM_MOT_NO_CKPT_EVERY", "0"),
+                "ds_graph_count_cache_enabled": getattr(self, "_ds_graph_count_cache", None) is not None,
             },
         ) as wait_diag:
             return self._train_impl(wait_diag)
@@ -945,6 +951,13 @@ class AgenticWAMTrainer:
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
+                        graph_counter = getattr(self, "_ds_graph_count_cache", None)
+                        if graph_counter is not None:
+                            graph_counts = graph_counter.cache_info()
+                            logger.info("[ds-graph-cache] step=%d original_scans=%d cache_hits=%d",
+                                        self.global_step, graph_counts["original_calls"], graph_counts["hits"])
+                            wandb_payload["perf/ds_graph_count_original_scans"] = graph_counts["original_calls"]
+                            wandb_payload["perf/ds_graph_count_cache_hits"] = graph_counts["hits"]
                         self._wandb_log(wandb_payload)
                         _ph = {"data": 0.0, "skew": 0.0, "fwd": 0.0, "bwd": 0.0, "opt": 0.0, "n": 0, "nopt": 0}
 

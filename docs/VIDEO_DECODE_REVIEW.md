@@ -1,6 +1,6 @@
 # Custom 数据视频解码检查
 
-结论：有明确优化空间，优先测试图像路径提前抽帧；解码器复用的收益取决于真实文件命中率。当前只新增只读基准和审查结果，没有修改训练 loader、预处理、数据集或采样。现场此前两卡持续 0% 已由 py-spy 定位到诊断工具的 `key_averages()` CPU 后处理；已在提交 `9fc49e6` 修复。这次阻塞不能用来证明视频解码是训练主瓶颈。
+结论：有明确优化空间，图像路径提前抽帧和有界 worker decoder 复用现已作为默认关闭的可选项实现，安装与验证见 [TRAINING_THROUGHPUT_FIXES.md](TRAINING_THROUGHPUT_FIXES.md)。本文保留修改前的路径审查与只读基准口径。后续现场 host 计时显示当前主要耗时在反向/DeepSpeed，视频优化应单独对照。现场此前两卡持续 0% 已由 py-spy 定位到诊断工具的 `key_averages()` CPU 后处理；已在提交 `9fc49e6` 修复。这次阻塞不能用来证明视频解码是训练主瓶颈。
 
 ## 当前路径
 
@@ -37,7 +37,7 @@
 
 实际实现应使用有上限的 worker 内 LRU，避免在父进程创建 native decoder 后被 fork 继承；同一个 decoder 也不应被多个线程同时 seek。容量应根据文件数和随机采样命中率测试，不能无限保留所有 decoder。
 
-本次基准只模拟一个保留 decoder，相当于单文件 100% 命中上限，未将这个缓存方案接入训练。合成样例中，缓存 dense 仅约 1.04 倍，低于提前稀疏请求的收益，不能据此保证真实随机文件访问有同样收益。
+本页基准只模拟一个保留 decoder，相当于单文件 100% 命中上限，不是后续训练用有界 worker LRU 的吞吐测试。合成样例中，缓存 dense 仅约 1.04 倍，低于提前稀疏请求的收益，不能据此保证真实随机文件访问有同样收益。
 
 ### backend、线程和存储
 
@@ -89,4 +89,4 @@ PYTHONPATH=src "$PY" scripts/diagnose_custom_data.py loader \
   --backend torchcodec --sparse-video > /tmp/loader_sparse.json
 ```
 
-`--sparse-video` 是已有诊断工具的基准选项，不是训练开关。真实 loader 与模型端仍需前述联动修改后才可启用提前采样。
+`--sparse-video` 是已有诊断工具的基准选项。新实现的训练开关为 `AGENTICWAM_SPARSE_VIDEO_DECODE=1`；启用前请按 [安装和正确性检查](TRAINING_THROUGHPUT_FIXES.md) 验证最终模型输入一致。

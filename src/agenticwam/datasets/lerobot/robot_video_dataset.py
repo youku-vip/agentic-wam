@@ -69,7 +69,35 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         code_slices_no_history: bool = False,  # ablation: omit completed-slice history from prompt
         code_slices_summary: bool = False,  # BOUNDED event log: "# Completed: k/n. Last: <slice>" (vs full transcript)
         save_norm_stats: bool = True,  # shared pretraining persists one copy in runtime
+        sparse_video_decode: Optional[bool] = None,
+        video_backend: Optional[str] = None,
+        video_decoder_cache_size: Optional[int] = None,
+        video_decoder_num_threads: Optional[int] = None,
     ):
+        self.num_frames = num_frames
+        self.action_video_freq_ratio = action_video_freq_ratio
+        if action_video_freq_ratio < 1:
+            raise ValueError("action_video_freq_ratio must be positive")
+        assert (num_frames - 1) % action_video_freq_ratio == 0, "num_frames-1 must be divisible by action_video_freq_ratio"
+        assert ((num_frames - 1) // action_video_freq_ratio) % 4 == 0, "video transitions must be divisible by 4"
+        self.video_sample_indices = list(range(0, num_frames, action_video_freq_ratio))
+        if sparse_video_decode is None:
+            value = os.environ.get("AGENTICWAM_SPARSE_VIDEO_DECODE", "0").strip().lower()
+            if value not in {"0", "1", "false", "true"}:
+                raise ValueError("AGENTICWAM_SPARSE_VIDEO_DECODE must be 0/1/false/true")
+            sparse_video_decode = value in {"1", "true"}
+        self.sparse_video_decode = bool(sparse_video_decode)
+        if video_backend is None:
+            video_backend = os.environ.get("AGENTICWAM_VIDEO_BACKEND") or None
+        if video_backend not in {None, "torchcodec", "pyav", "video_reader"}:
+            raise ValueError(f"Unsupported video backend: {video_backend}")
+        if video_decoder_cache_size is None:
+            video_decoder_cache_size = int(os.environ.get("AGENTICWAM_VIDEO_DECODER_CACHE_SIZE", "0"))
+        if video_decoder_num_threads is None:
+            value = os.environ.get("AGENTICWAM_VIDEO_DECODER_NUM_THREADS")
+            video_decoder_num_threads = int(value) if value is not None else None
+        if video_decoder_cache_size < 0 or (video_decoder_num_threads is not None and video_decoder_num_threads < 0):
+            raise ValueError("video decoder cache size and thread count must be nonnegative")
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
@@ -80,16 +108,14 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             episode_indices=(episode_indices if isinstance(episode_indices, (str, dict))  # YAMFIX-PERSUB2
                             else list(episode_indices)) if episode_indices is not None else None,
             global_sample_stride=global_sample_stride,
+            image_obs_indices=self.video_sample_indices if self.sparse_video_decode else None,
+            video_backend=video_backend,
+            video_decoder_cache_size=video_decoder_cache_size,
+            video_decoder_num_threads=video_decoder_num_threads,
         )
-    
-        self.num_frames = num_frames
-        self.action_video_freq_ratio = action_video_freq_ratio
-        
-        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
-            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
-        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
-            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+        logger.info("Video decode: sparse=%s image_frames=%d state_frames=%d action_frames=%d backend=%s cache_handles_per_worker=%d threads=%s",
+                    self.sparse_video_decode, len(self.video_sample_indices) if self.sparse_video_decode else num_frames,
+                    num_frames, num_frames - 1, video_backend or "auto", video_decoder_cache_size, video_decoder_num_threads)
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -163,6 +189,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if processor is not None:
             if isinstance(processor, DictConfig):
                 processor = instantiate(processor)
+            if self.sparse_video_decode:
+                if not hasattr(processor, "set_image_obs_steps"):
+                    raise TypeError("sparse_video_decode requires a processor with set_image_obs_steps()")
+                processor.set_image_obs_steps(len(self.video_sample_indices))
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
@@ -221,13 +251,18 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
         num_cameras = 1
         if video.ndim == 5:
-            video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
+            if not self.sparse_video_decode:
+                video = video[:, self.video_sample_indices, :, :, :] # [num_cameras, T_video, C, H, W]
             num_cameras, T_video, C, H, W = video.shape
         else:
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
+            if not self.sparse_video_decode:
+                video = video[self.video_sample_indices, :, :, :] # [T_video, C, H, W]
             T_video, C, H, W = video.shape
-        image_is_pad = image_is_pad[self.video_sample_indices]
+        if not self.sparse_video_decode:
+            image_is_pad = image_is_pad[self.video_sample_indices]
+        if T_video != len(self.video_sample_indices) or image_is_pad.shape[0] != T_video:
+            raise ValueError("Video/image padding length does not match the selected image window")
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
         if self.concat_multi_camera == "multiview":

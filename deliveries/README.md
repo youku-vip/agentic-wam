@@ -1,5 +1,9 @@
 # Custom 数据代码审查交付包
 
+训练等待优化包：`training-throughput-fixes-v1.zip`，包括可选的 DeepSpeed 反向参数计数缓存、图像提前抽帧、worker decoder LRU、只读一致性检查与保留本地配置的安装器。优先阅读 [安装与验证命令](../docs/TRAINING_THROUGHPUT_FIXES.md)。默认不开启优化，需安装后显式设置环境变量。
+
+以下说明对应原始 `custom-data-review.zip`：
+
 - uploaded/：用户提供的元数据、代码缓存、顺序表、审计与归一化统计文件，内容保持原样，仅统一文件名。
 - generated/：本次生成的检查脚本、报告、JSON检查结果、图文对照脚本及测试产物。
 - MANIFEST.json：各文件长度与SHA256。

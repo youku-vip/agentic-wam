@@ -74,6 +74,8 @@ class _V3SingleDataset(torch.utils.data.Dataset):
         delta_timestamps: dict[str, list[float]],
         tolerance_s: float | None = None,
         video_backend: str | None = None,
+        decoder_cache_size: int = 0,
+        decoder_num_threads: int | None = None,
     ):
         self.root = Path(ds_root)
         self.meta = V3LeRobotDatasetMetadata(str(ds_root), self.root)
@@ -100,6 +102,8 @@ class _V3SingleDataset(torch.utils.data.Dataset):
         self.num_episodes = len(self.episodes)
 
         self.video_backend = video_backend
+        self.decoder_cache_size = decoder_cache_size
+        self.decoder_num_threads = decoder_num_threads
         self.tolerance_s = float(tolerance_s or 1.0 / reader.fps - 1e-4)
         self.during_training = True
         self.delta_indices = {
@@ -153,7 +157,9 @@ class _V3SingleDataset(torch.utils.data.Dataset):
                 path = self.meta.reader.video_file(ep_id, key)
                 query_timestamps = self.meta.reader.video_timestamps(ep_id, key, clipped)
                 sample[key] = decode_video_frames(
-                    path, query_timestamps, self.tolerance_s, self.video_backend
+                    path, query_timestamps, self.tolerance_s, self.video_backend,
+                    decoder_cache_size=self.decoder_cache_size,
+                    decoder_num_threads=self.decoder_num_threads,
                 )  # float32 [T,3,H,W] in [0,1]
             else:
                 sample[key] = _tensor_rows(frame, key, clipped)
@@ -186,6 +192,8 @@ class V3MultiLeRobotDataset(torch.utils.data.Dataset):
         tolerances_s: dict | None = None,
         download_videos: bool = True,
         video_backend: str | None = None,
+        decoder_cache_size: int = 0,
+        decoder_num_threads: int | None = None,
     ):
         super().__init__()
         if not dataset_dirs:
@@ -204,6 +212,8 @@ class V3MultiLeRobotDataset(torch.utils.data.Dataset):
                 delta_timestamps=delta_timestamps,
                 tolerance_s=tolerances_s.get(name) if tolerances_s else None,
                 video_backend=video_backend,
+                decoder_cache_size=decoder_cache_size,
+                decoder_num_threads=decoder_num_threads,
             )
             for name in self.ds_names
         ]

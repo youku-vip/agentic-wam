@@ -1,0 +1,47 @@
+{
+  "synthetic": true,
+  "gpu_used": false,
+  "torch": "2.7.1+cu128",
+  "results": [
+    {
+      "parameters": 128,
+      "original": {
+        "backward_p50_seconds": 0.06625427900144132,
+        "trials": 3,
+        "last_count_cache": null
+      },
+      "cached": {
+        "backward_p50_seconds": 0.002520067006116733,
+        "trials": 3,
+        "last_count_cache": {
+          "original_calls": 1,
+          "hits": 127,
+          "entries": 1,
+          "max_entries": 64
+        }
+      },
+      "speedup": 26.290681494034978
+    },
+    {
+      "parameters": 512,
+      "original": {
+        "backward_p50_seconds": 1.1221044580015587,
+        "trials": 3,
+        "last_count_cache": null
+      },
+      "cached": {
+        "backward_p50_seconds": 0.012029891004203819,
+        "trials": 3,
+        "last_count_cache": {
+          "original_calls": 1,
+          "hits": 511,
+          "entries": 1,
+          "max_entries": 64
+        }
+      },
+      "speedup": 93.27636115817191
+    }
+  ],
+  "limits": "Scalar CPU autograd graph plus the actual DeepSpeed counting helper; not an end-to-end GPU/ZeRO training benchmark.",
+  "deepspeed": "0.18.5"
+}

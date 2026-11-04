@@ -43,11 +43,13 @@ class AgenticWAMProcessor(BaseProcessor):
         # fill for missing camera slots when the data has fewer cameras than num_output_cameras:
         # "zeros" (blank views) or "repeat" (cycle the available views; single-camera ego data)
         camera_padding: Literal["zeros", "repeat"] = "zeros",
+        num_image_steps: Optional[int] = None,
     ):
         assert camera_padding in ("zeros", "repeat"), camera_padding
         self.camera_padding = camera_padding
         self.shape_meta = shape_meta
         self.num_obs_steps = num_obs_steps
+        self.set_image_obs_steps(num_obs_steps if num_image_steps is None else num_image_steps)
         self.num_output_cameras = num_output_cameras
         self.action_output_dim = action_output_dim
         self.proprio_output_dim = proprio_output_dim
@@ -98,6 +100,12 @@ class AgenticWAMProcessor(BaseProcessor):
         if self._is_train is None:
             raise ValueError("is_train has not been set. Please call train() and eval() first.")
         return self._is_train
+
+    def set_image_obs_steps(self, num_image_steps: int):
+        if num_image_steps < 1:
+            raise ValueError("num_image_steps must be positive")
+        self.num_image_steps = num_image_steps
+        return self
 
     @property
     def normalizer(self) -> LinearNormalizer:
@@ -229,8 +237,8 @@ class AgenticWAMProcessor(BaseProcessor):
             for trans in current_transforms:
                 image = trans(image)
             
-            meta_shape = [self.num_obs_steps] + shape
-            assert image.shape == meta_shape, \
+            meta_shape = (self.num_image_steps, *shape)
+            assert tuple(image.shape) == meta_shape, \
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 
             processed_images.append(image)

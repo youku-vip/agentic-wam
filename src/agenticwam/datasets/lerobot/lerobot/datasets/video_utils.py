@@ -27,6 +27,7 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from PIL import Image
+from agenticwam.datasets.lerobot.decoder_cache import get_video_decoder, discard_video_decoder
 
 
 def get_safe_default_codec():
@@ -44,6 +45,7 @@ def decode_video_frames(
     timestamps: list[float],
     tolerance_s: float,
     backend: str | None = None,
+    *, decoder_cache_size: int = 0, decoder_num_threads: int | None = None,
 ) -> torch.Tensor:
     """
     Decodes video frames using the specified backend.
@@ -63,8 +65,12 @@ def decode_video_frames(
         backend = get_safe_default_codec()
     if backend == "torchcodec":
         try:
-            return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+            return decode_video_frames_torchcodec(
+                video_path, timestamps, tolerance_s,
+                decoder_cache_size=decoder_cache_size, decoder_num_threads=decoder_num_threads,
+            )
         except Exception as err:
+            discard_video_decoder(video_path)
             warnings.warn(
                 f"torchcodec video decode failed ({type(err).__name__}: {err}); falling back to torchvision/pyav."
             )
@@ -180,6 +186,7 @@ def decode_video_frames_torchcodec(
     tolerance_s: float,
     device: str = "cpu",
     log_loaded_timestamps: bool = False,
+    *, decoder_cache_size: int = 0, decoder_num_threads: int | None = None,
 ) -> torch.Tensor:
     """Loads frames associated with the requested timestamps of a video using torchcodec.
 
@@ -192,13 +199,12 @@ def decode_video_frames_torchcodec(
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
 
-    if importlib.util.find_spec("torchcodec"):
-        from torchcodec.decoders import VideoDecoder
-    else:
+    if not importlib.util.find_spec("torchcodec"):
         raise ImportError("torchcodec is required but not available.")
 
     # initialize video decoder
-    decoder = VideoDecoder(video_path, device=device, seek_mode="approximate")
+    decoder = get_video_decoder(video_path, device=device, cache_size=decoder_cache_size,
+                                num_threads=decoder_num_threads)
     loaded_frames = []
     loaded_ts = []
     # get metadata for frame information
