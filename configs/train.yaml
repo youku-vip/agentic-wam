@@ -23,6 +23,11 @@ log_every: 10
 save_every: 100
 eval_every: 50
 eval_num_inference_steps: 10
+# Actual free generation on the latest training microbatch (independent of eval_every).
+# 0 disables; max_samples=0 probes every sample per rank. Adds inference time.
+code_eval_every: 100
+code_eval_max_samples: 0
+code_eval_inference_steps: 10
 
 # training
 gradient_accumulation_steps: 1

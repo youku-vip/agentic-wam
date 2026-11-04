@@ -18,6 +18,7 @@ from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, Se
 from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
+from .utils.code_metrics import COUNT_KEYS, probe_code_batch, summarize_code_counts
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
@@ -49,6 +50,11 @@ class AgenticWAMTrainer:
         self.save_optimizer_state = bool(cfg.get("save_optimizer_state", False))
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+        self.code_eval_every = int(cfg.get("code_eval_every", 100))
+        self.code_eval_max_samples = int(cfg.get("code_eval_max_samples", 0))
+        self.code_eval_inference_steps = int(cfg.get("code_eval_inference_steps", 10))
+        if self.code_eval_every < 0 or self.code_eval_max_samples < 0 or self.code_eval_inference_steps <= 0:
+            raise ValueError("code_eval_every/max_samples must be nonnegative; code_eval_inference_steps must be positive")
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
@@ -691,6 +697,50 @@ class AgenticWAMTrainer:
             state_file,
         )
 
+    def evaluate_code_batch(self, model, sample):
+        """All ranks probe the latest microbatch; reduce counts, never local ratios."""
+        started = time.perf_counter()
+        counts = dict.fromkeys(COUNT_KEYS, 0)
+        examples = []
+        error = None
+        try:
+            plugin = self.accelerator.state.deepspeed_plugin
+            stage = plugin.deepspeed_config.get("zero_optimization", {}).get("stage", 0) if plugin else 0
+            if int(stage) == 3:
+                raise ValueError("Generation probe requires unsharded parameters (ZeRO 0/1/2); ZeRO 3 is unsupported")
+            counts, examples = probe_code_batch(
+                model, sample, inference_steps=self.code_eval_inference_steps,
+                max_samples=self.code_eval_max_samples,
+            )
+        except Exception as exc:
+            # Every rank still reaches the same collective. Never score a failed probe as zero.
+            error = f"{type(exc).__name__}: {exc}"
+            logger.warning("[code-eval] rank=%d failed: %s", self.accelerator.process_index, error)
+        packed = torch.tensor(
+            [int(error is not None)] + [counts[key] for key in COUNT_KEYS],
+            dtype=torch.int64, device=self.accelerator.device,
+        )
+        totals = self.accelerator.reduce(packed, reduction="sum").cpu().tolist()
+        if totals[0]:
+            if self.accelerator.is_main_process:
+                logger.warning("[code-eval] step=%d skipped: %d rank(s) failed; no accuracy reported", self.global_step, totals[0])
+                self._wandb_log({"code_eval/failed_ranks": totals[0]})
+            return None
+        metrics = summarize_code_counts(dict(zip(COUNT_KEYS, totals[1:])))
+        if self.accelerator.is_main_process:
+            metrics["seconds"] = time.perf_counter() - started
+            metrics["failed_ranks"] = 0
+            logger.info("[code-eval] step=%d %s", self.global_step, json.dumps(metrics, sort_keys=True))
+            self._wandb_log({f"code_eval/{key}": value for key, value in metrics.items()})
+            # Only rank 0 examples are written; metrics above include ALL ranks.
+            path = Path(self.output_dir) / "code_eval.jsonl"
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"step": self.global_step, "metrics": metrics,
+                    "examples_rank0": examples, "inference_steps": self.code_eval_inference_steps,
+                    "canvas_tokens": model._resolve_infer_code_tokens(),
+                    "max_samples_per_rank": self.code_eval_max_samples}, ensure_ascii=False) + "\n")
+        return metrics
+
     def train(self):
         self._set_dit_only_train_mode()
 
@@ -869,6 +919,11 @@ class AgenticWAMTrainer:
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
                         _ph = {"data": 0.0, "skew": 0.0, "fwd": 0.0, "bwd": 0.0, "opt": 0.0, "n": 0, "nopt": 0}
+
+                    if (self.code_eval_every > 0
+                            and self.global_step % self.code_eval_every == 0
+                            and getattr(unwrapped_model, "code_expert", None) is not None):
+                        self.evaluate_code_batch(unwrapped_model, sample)
 
                     if (
                         self.eval_every > 0
