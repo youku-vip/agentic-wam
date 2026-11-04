@@ -220,7 +220,7 @@ class _CosmosTextEncoder:
                 if b is not None and b.is_meta:
                     mod._buffers[bn] = torch.zeros(b.shape, dtype=torch.float32)
         self.qwen = qwen.to(device, dtype).eval()
-        self.proc = AutoProcessor.from_pretrained("nvidia/Cosmos-Reason1-7B")
+        self.proc = AutoProcessor.from_pretrained("/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/Cosmos-Reason1-7B")
         self.device = device
         self.max_len = int(max_len)
         # Optional for a policy sharing one GPU with the perception services.
