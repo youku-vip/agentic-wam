@@ -29,6 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from agenticwam.utils.logging_config import get_logger
+from agenticwam.utils.wait_diagnostics import diagnostic_range
 
 _VIZ = {"active": False, "done": False, "steps": []}
 from .generic_mot import GenericMoT
@@ -536,25 +537,28 @@ class AgenticWAMCosmos(nn.Module):
         # Compute dtype = the trainable params' dtype (bf16 under DeepSpeed, fp32 under autocast).
         # Dataloader tensors are fp32; cast action/proprio so they match the (bf16) expert weights.
         cdt = next(self.action_expert.parameters()).dtype
-        video = sample["video"].to(device)                         # [B,3,T,H,W] multiview in [-1,1]
-        action = sample["action"].to(device=device, dtype=cdt)     # [B,Ta,a_dim]
-        proprio = sample.get("proprio", None)
-        if proprio is not None:
-            proprio = proprio.to(device=device, dtype=cdt)
+        with diagnostic_range("input_device_and_dtype"):
+            video = sample["video"].to(device)                         # [B,3,T,H,W] multiview in [-1,1]
+            action = sample["action"].to(device=device, dtype=cdt)     # [B,Ta,a_dim]
+            proprio = sample.get("proprio", None)
+            if proprio is not None:
+                proprio = proprio.to(device=device, dtype=cdt)
         action_is_pad = sample.get("action_is_pad", None)
         num_cond_pixel = int(self.num_cond_frames)   # obs-conditioning (the cond-frame training)
 
         # 1. encode video + resolve text embeddings. Prefer precomputed Cosmos-Reason1 embeds
         #    (sample['prompt_embs'], cached offline like AgenticWAM's text cache) so the frozen 8.3B
         #    encoder stays out of the training model; else run it on-the-fly if present.
-        latents = self._encode_video_latents(video)                # [B,48,T,H,W]
-        prompt_embs = sample.get("prompt_embs")
-        if prompt_embs is None:
-            if self.text_encoder is None:
-                raise ValueError("no text_encoder and sample has no precomputed 'prompt_embs'")
-            with torch.no_grad():
-                prompt_embs = self.text_encoder(sample["text"].to(device))
-        prompt_embs = prompt_embs.to(device=device, dtype=latents.dtype)
+        with diagnostic_range("vae_encode"):
+            latents = self._encode_video_latents(video)                # [B,48,T,H,W]
+        with diagnostic_range("text_embeddings"):
+            prompt_embs = sample.get("prompt_embs")
+            if prompt_embs is None:
+                if self.text_encoder is None:
+                    raise ValueError("no text_encoder and sample has no precomputed 'prompt_embs'")
+                with torch.no_grad():
+                    prompt_embs = self.text_encoder(sample["text"].to(device))
+            prompt_embs = prompt_embs.to(device=device, dtype=latents.dtype)
         B, C, T, H, W = latents.shape
         nc = self.n_cameras
         assert T % nc == 0, f"latent frames {T} not divisible by n_cameras {nc}"
@@ -622,15 +626,14 @@ class AgenticWAMCosmos(nn.Module):
             elif _r < _pc + _pv:
                 self._cfg_mode = "drop_video_for_action"
         if self.code_expert is not None and sample.get("policy_code") is not None:
-            input_ids, code_labels = self.code_expert.build_code_batch(
-                # Dual-instruction: prefer `prompt_code` (this episode's OWN randomised instruction,
-                # emitted only when the dataset runs code_instruction_mode='episode'). Absent by
-                # default -> falls back to `prompt`, i.e. behaviour is unchanged.
-                instructions=(sample.get("prompt_nohist")
-                              if (getattr(self, "code_memory_enabled", False) and sample.get("prompt_nohist") is not None)
-                              else (sample.get("prompt_code") if sample.get("prompt_code") is not None
-                                    else sample.get("prompt"))),
-                codes=sample["policy_code"], device=device)
+            with diagnostic_range("code_tokenize_and_mask"):
+                input_ids, code_labels = self.code_expert.build_code_batch(
+                    # Dual-instruction: prefer the same episode's own instruction when available.
+                    instructions=(sample.get("prompt_nohist")
+                                  if (getattr(self, "code_memory_enabled", False) and sample.get("prompt_nohist") is not None)
+                                  else (sample.get("prompt_code") if sample.get("prompt_code") is not None
+                                        else sample.get("prompt"))),
+                    codes=sample["policy_code"], device=device)
             _mem_M = None; _mem_K = 0
             if getattr(self, "code_memory_enabled", False) and self.code_memory is not None:
                 _bs = input_ids.shape[0]; _mem_K = int(self.code_memory.K)
@@ -643,7 +646,8 @@ class AgenticWAMCosmos(nn.Module):
                 _mid = getattr(self.code_expert, "mask_token_id", None)
                 if _mid is not None:
                     input_ids = torch.full_like(input_ids, _mid)
-            _vit = self._vit_prefix(sample["video"].to(device)) if getattr(self, "code_vision", None) is not None else None
+            with diagnostic_range("vision_prefix"):
+                _vit = self._vit_prefix(sample["video"].to(device)) if getattr(self, "code_vision", None) is not None else None
             if _vit is not None:
                 code_labels = torch.cat([torch.full((code_labels.shape[0], _vit.shape[1]), -100,
                                                     dtype=code_labels.dtype, device=code_labels.device), code_labels], dim=1)
@@ -668,7 +672,8 @@ class AgenticWAMCosmos(nn.Module):
         mask = self._build_mot_attention_mask(video_tokens.shape[1], action_pre["tokens"].shape[1],
                                               device, code_seq_len, video_cond_tok=_vct,
                                               code_prefix_len=(_vp + _mk) if _vp else 0)   # memory slots join the sealed prefix
-        out = self.mot(tokens, aux, mask)
+        with diagnostic_range("mot_forward"):
+            out = self.mot(tokens, aux, mask)
 
         # 6. video velocity loss (denoise frames only; uniform weight — Beta sampling already
         #    shapes the noise-level distribution).
@@ -693,21 +698,24 @@ class AgenticWAMCosmos(nn.Module):
                        else (a_ps * aw).mean())
 
         loss = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
-        loss_dict = {"loss_video": float(loss_video.detach()), "loss_action": float(loss_action.detach())}
+        with diagnostic_range("metric_scalars_to_host"):
+            loss_dict = {"loss_video": float(loss_video.detach()), "loss_action": float(loss_action.detach())}
         _cm = getattr(self, "_cfg_mode", "normal")
         if os.environ.get("AGENTICWAM_CFG_DROPOUT"):
             loss_dict["cfg_drop_code"] = 1.0 if _cm == "drop_code" else 0.0
             loss_dict["cfg_drop_video"] = 1.0 if _cm == "drop_video_for_action" else 0.0
         if _rw_on:   # sigma/weight instrumentation for the reweighting experiment
-            loss_dict["sigma_mean"] = float(sigma.mean().detach())
-            loss_dict["sigma_lo_frac"] = float((sigma < 0.3).float().mean().detach())
-            loss_dict["w_v_mean"] = float(w_v.mean().detach())
-            loss_dict["w_cond_mean"] = float(w_cond.mean().detach())
+            with diagnostic_range("metric_scalars_to_host"):
+                loss_dict["sigma_mean"] = float(sigma.mean().detach())
+                loss_dict["sigma_lo_frac"] = float((sigma < 0.3).float().mean().detach())
+                loss_dict["w_v_mean"] = float(w_v.mean().detach())
+                loss_dict["w_cond_mean"] = float(w_cond.mean().detach())
 
         # 8. code CE
         if code_pre is not None and code_labels is not None and "code" in out:
-            code_logits = self.code_expert.post_dit(out["code"])
-            code_out = self.code_expert.code_loss(code_logits, code_labels)
+            with diagnostic_range("code_loss_and_accuracy"):
+                code_logits = self.code_expert.post_dit(out["code"])
+                code_out = self.code_expert.code_loss(code_logits, code_labels)
             _code_term = code_out["loss"]
             # RL HOOK (wd1-style reward-weighted MLE): when `_rl_weights` [B] is set, the code term
             # becomes sum_g w_g * per-sample-CE_g instead of the mean. Same single cross_entropy op,
@@ -737,14 +745,16 @@ class AgenticWAMCosmos(nn.Module):
                 _c_ps = (_ce * _vm).sum(1) / _vm.sum(1).clamp(min=1.0)                # [B]
                 _code_term = (_c_ps * w_cond.to(_c_ps.dtype)).mean()
             loss = loss + self.loss_lambda_code * _code_term
-            loss_dict["loss_code"] = float(code_out["loss"].detach())
-            loss_dict["code_acc"] = float(code_out["acc"].detach())
+            with diagnostic_range("metric_scalars_to_host"):
+                loss_dict["loss_code"] = float(code_out["loss"].detach())
+                loss_dict["code_acc"] = float(code_out["acc"].detach())
             # EOS-excluded accuracy, emitted by code_loss whenever the EOS labels are non-trivial
             # (pad-EOS window/weight, or a fixed code_canvas). Under canvas 150 about 36% of canvas
             # labels are EOS and trivially predictable, so code_acc is inflated and NOT comparable to
             # the batch-max-aligned runs; code_acc_noneos is the comparable curve.
             if "acc_noneos" in code_out:
-                loss_dict["code_acc_noneos"] = float(code_out["acc_noneos"].detach())
+                with diagnostic_range("metric_scalars_to_host"):
+                    loss_dict["code_acc_noneos"] = float(code_out["acc_noneos"].detach())
 
         return loss, loss_dict
 
@@ -799,7 +809,8 @@ class AgenticWAMCosmos(nn.Module):
 
         # densities of the two targets at the drawn t (float32 for stability)
         y = (t / float(sc)).clamp(1e-6, 1 - 1e-6)
-        p_cur = torch.exp(beta.log_prob(y.cpu()).to(device)) / float(sc)        # p of sc*Beta(a,b)
+        with diagnostic_range("sigma_density_cpu_roundtrip"):
+            p_cur = torch.exp(beta.log_prob(y.cpu()).to(device)) / float(sc)        # p of sc*Beta(a,b)
         p_cur = torch.where(t <= float(sc), p_cur, torch.zeros_like(p_cur)).squeeze(-1)
         p_inf = torch.ones_like(p_cur)                                          # U(0,1)
         q = (alpha * p_cur + (1.0 - alpha) * p_inf).clamp(min=1e-8)

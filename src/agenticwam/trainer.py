@@ -24,6 +24,7 @@ from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
+from .utils.wait_diagnostics import WaitDiagnostics, diagnostic_range
 
 logger = get_logger(__name__)
 
@@ -220,7 +221,8 @@ class AgenticWAMTrainer:
     def _wandb_log(self, payload: dict):
         if self.wandb_run is None:
             return
-        self.wandb_run.log(payload, step=self.global_step)
+        with diagnostic_range("wandb_log"):
+            self.wandb_run.log(payload, step=self.global_step)
 
     def _finish_wandb(self):
         if self.wandb_run is None:
@@ -742,6 +744,22 @@ class AgenticWAMTrainer:
         return metrics
 
     def train(self):
+        plugin = self.accelerator.state.deepspeed_plugin
+        with WaitDiagnostics.from_env(
+            self.output_dir, rank=self.accelerator.process_index,
+            device=self.accelerator.device, start_step=self.global_step,
+            metadata={
+                "world_size": self.accelerator.num_processes, "batch_size_per_rank": self.batch_size,
+                "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                "zero_stage": plugin.deepspeed_config.get("zero_optimization", {}).get("stage") if plugin else None,
+                "num_workers_per_rank": self.num_workers, "mixed_precision": self.mixed_precision,
+                "phase_timing_env": os.environ.get("AGENTICWAM_PHASE_TIMING", "1"),
+                "mot_no_ckpt_every_env": os.environ.get("AGENTICWAM_MOT_NO_CKPT_EVERY", "0"),
+            },
+        ) as wait_diag:
+            return self._train_impl(wait_diag)
+
+    def _train_impl(self, wait_diag):
         self._set_dit_only_train_mode()
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -770,15 +788,18 @@ class AgenticWAMTrainer:
         _ph = {"data": 0.0, "skew": 0.0, "fwd": 0.0, "bwd": 0.0, "opt": 0.0, "n": 0}
         _ph_win = max(int(self.log_every), 1)
         def _measuring():
-            return _ph_on and (self.global_step % _ph_win == 0)
+            # Avoid diagnostic barriers/synchronization inside the profiler window.
+            return _ph_on and not wait_diag.capturing and (self.global_step % _ph_win == 0)
         def _sync():
             if _measuring() and torch.cuda.is_available():
                 torch.cuda.synchronize()
 
         while self.global_step < self.max_steps:
+            wait_diag.before_batch(self.global_step)
             try:
                 _t0 = time.perf_counter()
-                sample = next(data_iter)
+                with diagnostic_range("data_next_including_h2d"):
+                    sample = next(data_iter)
                 if _measuring():
                     _ph["data"] += time.perf_counter() - _t0
                 self.batch_in_epoch += 1
@@ -787,10 +808,13 @@ class AgenticWAMTrainer:
                 self.batch_in_epoch = 0
                 self.train_sampler.clear_resume_batch_offset()
                 data_iter = iter(self.train_loader)
+                wait_diag.after_batch(self.global_step)
                 continue
 
             with self.accelerator.accumulate(self.model):
-                train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
+                # Forward must go through DDP/DeepSpeed, even if the wrapper does
+                # not expose the module's custom `training_loss` method.
+                train_model = self.model
 
                 # SKEW vs COMPUTE: `fwd` is timed with a synchronize() AFTER forward, so in a
                 # distributed job any inter-rank skew carried in from the previous step lands in
@@ -811,7 +835,7 @@ class AgenticWAMTrainer:
                     _ph["skew"] = _ph.get("skew", 0.0) + time.perf_counter() - _t0
 
                 _t0 = time.perf_counter()
-                with self.accelerator.autocast():
+                with diagnostic_range("forward"), self.accelerator.autocast():
                     # FIX 2026-09-07 (grad-accum): call the WRAPPER (DeepSpeedEngine.forward -> AgenticWAMCosmos.forward ->
                     # training_loss), not `.training_loss` on the module. DeepSpeed 0.18 scales the loss gradient
                     # by 1/gradient_accumulation_steps via hooks it registers on the outputs of engine.forward();
@@ -823,7 +847,8 @@ class AgenticWAMTrainer:
                 if _measuring(): _ph["fwd"] += time.perf_counter() - _t0
 
                 _t0 = time.perf_counter()
-                self.accelerator.backward(loss)
+                with diagnostic_range("backward_including_comm"):
+                    self.accelerator.backward(loss)
                 _sync()
                 if _measuring():
                     _ph["bwd"] += time.perf_counter() - _t0
@@ -831,8 +856,9 @@ class AgenticWAMTrainer:
 
                 if self.accelerator.sync_gradients:
                     _t0 = time.perf_counter()
-                    grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
+                    with diagnostic_range("clip_and_optimizer_including_comm"):
+                        grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:
                         _rw = getattr(self, "_rewarm_n", 0)
                         if _rw > 0:   # restore the TRUE scheduled lr: the cosine recursion must not see the ramp
@@ -952,6 +978,7 @@ class AgenticWAMTrainer:
                             )
 
                     if self.global_step >= self.max_steps:
+                        wait_diag.after_batch(self.global_step)
                         ckpt_info = self.save_checkpoint()
                         if self.accelerator.is_main_process:
                             logger.info(
@@ -961,6 +988,8 @@ class AgenticWAMTrainer:
                                 ckpt_info["state_path"],
                             )
                         return
+
+            wait_diag.after_batch(self.global_step)
 
         ckpt_info = self.save_checkpoint()
         if self.accelerator.is_main_process:
