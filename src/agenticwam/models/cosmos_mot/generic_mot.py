@@ -25,6 +25,7 @@ action expert = ActionDiT rebuilt at 28/16/128.
 from __future__ import annotations
 
 from typing import Any, Dict
+import os
 
 import torch
 import torch.nn as nn
@@ -46,7 +47,15 @@ class GenericMoT(nn.Module):
 
         self.experts = nn.ModuleDict(experts)
         self.expert_order = list(self.experts.keys())
-        self.checkpoint_mixed_attn = checkpoint_mixed_attn
+        import os
+        self.checkpoint_mixed_attn = (
+            checkpoint_mixed_attn
+            and os.environ.get("AGENTICWAM_DISABLE_MOT_ATTN_CKPT", "0") != "1"
+        )
+        logger.info(
+            "MoT mixed-attention activation checkpointing: %s",
+            self.checkpoint_mixed_attn,
+        )
 
         e0 = self.experts[self.expert_order[0]]
         self.num_layers = len(e0.blocks)
@@ -69,11 +78,16 @@ class GenericMoT(nn.Module):
             n = sum(p.numel() for p in self.experts[name].parameters()) / 1e9
             logger.info(f"  Expert '{name}': num_params={n:.2f} B")
 
-    def _mixed_attention(self, q, k, v, attention_mask):
+    def _mixed_attention(self, q, k, v, attention_mask, layer_idx):
         def _fwd(q, k, v):
             return flash_attention(q=q, k=k, v=v, num_heads=self.num_heads, ctx_mask=attention_mask)
 
-        if self.checkpoint_mixed_attn and self.training:
+        # AGENTICWAM_MOT_NO_CKPT_EVERY:
+        skip_every = int(os.environ.get('AGENTICWAM_MOT_NO_CKPT_EVERY', '0'))
+        use_checkpoint = self.checkpoint_mixed_attn and self.training
+        if skip_every > 0 and (layer_idx + 1) % skip_every == 0:
+            use_checkpoint = False
+        if use_checkpoint:
             return checkpoint(_fwd, q, k, v, use_reentrant=False)
         return _fwd(q, k, v)
 
@@ -120,7 +134,7 @@ class GenericMoT(nn.Module):
                     f"attention_mask seq {tuple(attention_mask.shape)} != total tokens {total}"
                 )
 
-            mixed = self._mixed_attention(q_cat, k_cat, v_cat, attention_mask)
+            mixed = self._mixed_attention(q_cat, k_cat, v_cat, attention_mask, layer_idx)
 
             start = 0
             for name, slen in zip(self.expert_order, seq_lens):
