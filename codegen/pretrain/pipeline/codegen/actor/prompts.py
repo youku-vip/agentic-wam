@@ -19,7 +19,7 @@ from codegen.api.active import API_DOC, EMBODIMENT
 from codegen.library import SKILLS_DOC
 from .media import _img, _txt
 
-if EMBODIMENT in ("yam", "yam_sft"):        # the prompt-module selection seam
+if EMBODIMENT in ("yam", "yam_sft", "custom_v3"):        # the prompt-module selection seam
     from . import prompts_yam as _emb
 else:
     from . import prompts_ego as _emb

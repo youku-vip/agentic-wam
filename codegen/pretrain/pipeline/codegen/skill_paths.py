@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 LIBRARY_ROOT = Path(__file__).resolve().parents[2] / "skill_library"
-LIBRARY_OF = {"yam": "yam", "ego": "ego", "yam_sft": "yam", "tianji_sharpa": "ego"}
+LIBRARY_OF = {"yam": "yam", "ego": "ego", "yam_sft": "yam", "custom_v3": "yam", "tianji_sharpa": "ego"}
 
 
 def library_dir(embodiment: str) -> Path:

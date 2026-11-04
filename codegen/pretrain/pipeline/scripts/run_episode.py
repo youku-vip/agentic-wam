@@ -53,7 +53,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     from codegen import config
     ap.add_argument("--embodiment", default=config.embodiment(),
-                    choices=["yam", "ego", "tianji_sharpa", "yam_sft"],
+                    choices=["yam", "ego", "tianji_sharpa", "yam_sft", "custom_v3"],
                     help="which embodiment's data/API/library this actor uses "
                          "(default: CODEGEN_EMBODIMENT env / the config file)")
     ap.add_argument("--task", required=True, help="dataset dir under the source root (e.g. train_shard_0)")

@@ -165,6 +165,8 @@ def frame_gap(embodiment: str) -> int:
 
 def video_stream(embodiment: str) -> str:
     """The camera stream the actor sees — part of every generation cache key."""
+    if embodiment == "custom_v3":
+        return "observation.images.head"
     if embodiment == "yam":
         return get("YAM_CAMERA")
     if embodiment == "ego":

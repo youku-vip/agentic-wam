@@ -15,7 +15,7 @@ from codegen import config
 
 EMBODIMENT = config.embodiment()   # CODEGEN_EMBODIMENT env > config file > "yam"
 
-if EMBODIMENT in ("yam", "yam_sft"):
+if EMBODIMENT in ("yam", "yam_sft", "custom_v3"):
     from .bimanual import (  # noqa: F401
         API_DOC,
         ARG_VOCAB,

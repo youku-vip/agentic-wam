@@ -54,7 +54,7 @@ def match_grippers(code, grips):
 #: the API rather than hardcoded (yam: *_gripper, ego: *_hand)
 def _primitive(kind: str) -> str:
     from codegen.api.active import EMBODIMENT, _API_SIG
-    name = f"{kind}_gripper" if EMBODIMENT in ("yam", "yam_sft") else f"{kind}_hand"
+    name = f"{kind}_gripper" if EMBODIMENT in ("yam", "yam_sft", "custom_v3") else f"{kind}_hand"
     if name not in _API_SIG:
         raise KeyError(f"{name} is not in the {EMBODIMENT} API")
     return name

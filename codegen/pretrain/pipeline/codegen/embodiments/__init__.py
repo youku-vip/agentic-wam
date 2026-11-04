@@ -21,6 +21,8 @@ def get_spec(name: str):
         from .tianji_sharpa import SPEC
     elif name == "yam_sft":
         from .yam_sft import SPEC
+    elif name == "custom_v3":
+        from .custom_v3 import SPEC
     else:
         raise ValueError(f"unknown embodiment {name!r} (expected 'yam', 'ego', 'yam_sft' or 'tianji_sharpa')")
     return SPEC

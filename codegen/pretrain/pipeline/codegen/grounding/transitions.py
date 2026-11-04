@@ -28,20 +28,26 @@ GRIP_MIN_DWELL = 20
 GRIP_HOVER_EPS = 0.02
 
 
-def grip_transitions(grip):
+def grip_transitions(grip, *, smooth_frames=GRIP_SMOOTH, min_run=GRIP_MIN_RUN,
+                     velocity_epsilon=GRIP_V_EPS, edge_pad=False):
     """ALL gripper open<->closed transitions for one arm, from the SIGN of the (smoothed)
     gripper VELOCITY rather than absolute thresholds. A sustained fall (velocity below
-    -GRIP_V_EPS for >= GRIP_MIN_RUN frames) is a CLOSE, pinned to the knee where the ramp
+    -GRIP_V_EPS for >= min_run frames) is a CLOSE, pinned to the knee where the ramp
     flattens (~contact); a sustained rise is an OPEN, pinned to where the plateau departs
     (~release). Returns the ordered list of (frame, "close"|"open")."""
     g = np.asarray(grip, dtype=np.float64)
     T = len(g)
     if T < 2:
         return []
-    gs = smooth(g, GRIP_SMOOTH)
+    if edge_pad and smooth_frames > 1 and T >= smooth_frames:
+        pad = smooth_frames // 2
+        gs = np.convolve(np.pad(g, (pad, pad), mode="edge"),
+                         np.ones(smooth_frames) / smooth_frames, mode="valid")[:T]
+    else:
+        gs = smooth(g, smooth_frames)
     v = np.zeros(T)
     v[1:] = np.diff(gs)
-    reg = np.where(v < -GRIP_V_EPS, -1, np.where(v > GRIP_V_EPS, 1, 0))  # -1 close, +1 open, 0 flat
+    reg = np.where(v < -velocity_epsilon, -1, np.where(v > velocity_epsilon, 1, 0))  # -1 close, +1 open, 0 flat
     # initial open/closed from the signal's own range (data-relative, not a fixed cutoff)
     state = "open" if gs[0] > (gs.min() + gs.max()) / 2.0 else "closed"
     ev = []
@@ -50,10 +56,10 @@ def grip_transitions(grip):
         j = i
         while j < T and reg[j] == reg[i]:
             j += 1
-        if reg[i] == -1 and (j - i) >= GRIP_MIN_RUN and state != "closed":
+        if reg[i] == -1 and (j - i) >= min_run and state != "closed":
             ev.append((j - 1, "close"))   # knee: end of the falling ramp ~ contact
             state = "closed"
-        elif reg[i] == 1 and (j - i) >= GRIP_MIN_RUN and state != "open":
+        elif reg[i] == 1 and (j - i) >= min_run and state != "open":
             ev.append((i, "open"))        # start of the rising ramp ~ release
             state = "open"
         i = j

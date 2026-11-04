@@ -56,7 +56,7 @@ def unmapped_ids(sub_id: np.ndarray, text: dict) -> list[int]:
     return sorted({int(i) for i in np.unique(sub_id)} - {int(k) for k in text} - {0})
 
 
-def sub_task_blocks(sub_id: np.ndarray, text: dict, noise_labels=NOISE_LABELS):
+def sub_task_blocks(sub_id: np.ndarray, text: dict, noise_labels=NOISE_LABELS, min_block=MIN_BLOCK):
     """Contiguous runs of the per-frame sub_task id -> ordered
     (start, end, label, noise_label).
 
@@ -72,7 +72,7 @@ def sub_task_blocks(sub_id: np.ndarray, text: dict, noise_labels=NOISE_LABELS):
         low = label.lower()
         if low in noise_labels:
             blocks.append((s, e, None, label))          # annotated noise
-        elif (not label) or (e - s) < MIN_BLOCK:
+        elif (not label) or (e - s) < min_block:
             blocks.append((s, e, None, None))           # gap / too short
         else:
             blocks.append((s, e, label, None))

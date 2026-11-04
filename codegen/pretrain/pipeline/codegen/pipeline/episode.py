@@ -65,7 +65,7 @@ def run_episode(args) -> int:
               f"(e.g. reading a selection layer without meta/). This is a "
               f"data-loading error, not a data property.", file=sys.stderr)
         return 3
-    blocks = sub_task_blocks(sub_id, text, noise_labels=spec.noise_labels)
+    blocks = sub_task_blocks(sub_id, text, noise_labels=spec.noise_labels, min_block=getattr(spec, "min_block", 8))
     unsegmented = not any(l for _, _, l, _n in blocks)
     if unsegmented:
         # ZERO labelled blocks with a HEALTHY mapping (the broken-mapping case
@@ -121,7 +121,7 @@ def run_episode(args) -> int:
     # INDEPENDENT post-hoc diagnostic, and a fully-matched slice still earns
     # its fine-grained grip_pins.
     vanilla = bool(getattr(args, "vanilla", False))
-    prompt_events = (EMBODIMENT == "yam") and not vanilla
+    prompt_events = (EMBODIMENT in ("yam", "custom_v3")) and not vanilla
     anchor_events = not vanilla
     # Everything that changes WHAT THE MODEL SEES must be in this key. frame_gap
     # and the video stream are not prompt TEXT but they decide the pixels: without
@@ -136,6 +136,9 @@ def run_episode(args) -> int:
         f"frame_gap={int(args.frame_gap)}", f"video_stream={video_stream}",
         f"max_slice_frames={config.get_int('MAX_SLICE_FRAMES')}",
     ]).encode()).hexdigest()[:12]
+
+    if episode.meta.get("codegen_signature"):
+        prompt_key = hashlib.sha1((prompt_key + episode.meta["codegen_signature"]).encode()).hexdigest()[:12]
 
     def cached(kind, k, fn):
         ck = f"{kind}_{prompt_key}:{k}"
@@ -370,6 +373,7 @@ def run_episode(args) -> int:
                     "unit": "subtask", "phases": rec}, indent=2))
     (out / artifacts.TRACE).write_text(json.dumps(
         {"task": args.task, "instruction": instruction, "unit": "subtask",
+         "episode_meta": episode.meta,
          "coder_model": args.coder_model,
          # actor-input mode: vanilla = annotation-only prompt AND uniform
          # sampling; prompt_events=False (all ego runs + vanilla) = no

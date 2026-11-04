@@ -94,7 +94,7 @@ def main() -> int:
                          "dedicated tag so vanilla and standard runs never share "
                          "run dirs")
     ap.add_argument("--embodiment", default=config.embodiment(),
-                    choices=["yam", "ego", "tianji_sharpa", "yam_sft"],
+                    choices=["yam", "ego", "tianji_sharpa", "yam_sft", "custom_v3"],
                     help="which embodiment's data/API/library this batch annotates "
                          "(default: CODEGEN_EMBODIMENT env / the config file)")
     ap.add_argument("--coder-model", default=config.get("CODER_MODEL"),
