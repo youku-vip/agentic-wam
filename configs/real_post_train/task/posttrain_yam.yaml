@@ -4,7 +4,7 @@
 # (configs/real_post_train/data/yam.yaml):
 #   bash scripts/train_real_yam.sh <dataset_dir> <code_cache.pt> [overrides]
 defaults:
-  - override /data: yam
+  - override /data: custom
   - override /model: agenticwam_cosmos
   - _self_
 
