@@ -20,6 +20,7 @@ def main():
     os.environ["AGENTICWAM_PHASE_TIMING"] = "0"
     os.environ["AGENTICWAM_WAIT_DIAG_STEPS"] = "1"
     os.environ["AGENTICWAM_WAIT_DIAG_WARMUP"] = "1"
+    os.environ["AGENTICWAM_WAIT_DIAG_MODE"] = "host"
     trainer = make_toy_trainer(paths[0], accelerator)
     trainer.train()
     assert trainer.global_step == 3
@@ -35,6 +36,8 @@ def main():
             assert not item["partial"]
             assert item["metadata"]["world_size"] == 2
             assert not item["timeline"]["gpu_activity_available"]
+            assert item["capture_mode"] == "host"
+            assert item["trace_file"] is None
             assert "clip_and_optimizer_including_comm" in item["host_phases"]
         print("PASS: actual trainer, 2 CPU/DDP ranks, accumulation=2, per-rank traces, synchronized weights")
     accelerator.wait_for_everyone()

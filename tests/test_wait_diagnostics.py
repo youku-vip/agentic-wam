@@ -1,8 +1,10 @@
 from contextlib import nullcontext
 import json
 import os
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 import unittest
 from unittest.mock import patch
 
@@ -103,7 +105,7 @@ class CaptureTests(unittest.TestCase):
             baseline_weights = {key: value.detach().clone() for key, value in baseline.model.state_dict().items()}
             baseline_rng = torch.get_rng_state().clone()
             with patch.dict(os.environ, {"AGENTICWAM_PHASE_TIMING": "0", "AGENTICWAM_WAIT_DIAG_STEPS": "1",
-                                         "AGENTICWAM_WAIT_DIAG_WARMUP": "1"}):
+                                         "AGENTICWAM_WAIT_DIAG_WARMUP": "1", "AGENTICWAM_WAIT_DIAG_MODE": "host"}):
                 profiled = make_toy_trainer(profiled_dir, accelerator)
                 profiled.train()
             self.assertEqual(profiled.global_step, 3)
@@ -132,7 +134,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_bounded_capture_covers_all_accumulated_microsteps(self):
         with TemporaryDirectory() as tmp:
-            with WaitDiagnostics(tmp, rank=1, active_steps=1, warmup_steps=1,
+            with WaitDiagnostics(tmp, rank=1, active_steps=1, warmup_steps=1, mode="cpu",
                                  metadata={"gradient_accumulation_steps": 2}) as diag:
                 diag.before_batch(0)
                 self.assertFalse(diag.capturing)
@@ -152,11 +154,87 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(summary["captured_microsteps"], 2)
             self.assertEqual(summary["host_phases"]["forward"]["calls"], 2)
             self.assertFalse(summary["partial"])
-            self.assertFalse(summary["timeline"]["gpu_activity_available"])
+            self.assertIsNone(summary["timeline"]["gpu_activity_available"])
+            self.assertTrue(summary["timeline"]["analysis_deferred"])
             trace_path = diag.summary_path.parent / summary["trace_file"]
             names = {event.get("name") for event in json.loads(trace_path.read_text())["traceEvents"]}
             self.assertIn("waitdiag/forward", names)
             self.assertEqual(len(list(diag.output_dir.glob("*.trace.json"))), 1)
+
+    def test_profiler_mode_exports_without_native_aggregation_or_json_parsing(self):
+        with TemporaryDirectory() as tmp, patch("torch.profiler.profile") as factory:
+            profiler = factory.return_value
+            profiler.key_averages.side_effect = AssertionError("native Kineto parsing must never run in training")
+            # Invalid JSON proves that the training process never reads/parses the raw trace.
+            profiler.export_chrome_trace.side_effect = lambda path: Path(path).write_text("offline trace payload")
+            with WaitDiagnostics(tmp, active_steps=1, warmup_steps=0, mode="cpu") as diag:
+                diag.before_batch(0)
+                with diagnostic_range("forward"):
+                    torch.ones(2).sum()
+                diag.after_batch(1)
+            profiler.key_averages.assert_not_called()
+            profiler.export_chrome_trace.assert_called_once()
+            summary = json.loads(diag.summary_path.read_text())
+            self.assertTrue(summary["timeline"]["analysis_deferred"])
+            self.assertEqual(summary["top_self_cpu_ops"], [])
+
+    def test_offline_trace_analysis_without_native_profiler(self):
+        spec = spec_from_file_location("summarize_wait_trace", Path(__file__).resolve().parents[1] / "scripts/summarize_wait_trace.py")
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with patch("torch.profiler.profile", side_effect=AssertionError("offline analysis must not start profiler")):
+            result = module.analyze_trace({"traceEvents": [
+                dict(name="waitdiag/microstep", cat="user_annotation", ph="X", ts=0, dur=1000),
+                dict(name="waitdiag/forward", cat="user_annotation", ph="X", ts=0, dur=800),
+                dict(name="cudaStreamSynchronize", cat="cuda_runtime", ph="X", ts=0, dur=100),
+                dict(name="gemm", cat="kernel", ph="X", ts=100, dur=500),
+            ]})
+        self.assertEqual(result["host_phases_inclusive"]["forward"]["total_host_ms"], .8)
+        self.assertEqual(result["top_cuda_runtime_host_times"]["cudaStreamSynchronize"]["calls"], 1)
+        self.assertAlmostEqual(result["timeline"]["uncovered_trace_window_fraction"], .5)
+
+    def test_host_mode_never_calls_profiler_or_cuda_even_with_cuda_device(self):
+        with TemporaryDirectory() as tmp, \
+                patch("torch.profiler.profile", side_effect=AssertionError("profiler must not start")), \
+                patch("torch.profiler.record_function", side_effect=AssertionError("no profiler scopes")), \
+                patch("torch.cuda.synchronize", side_effect=AssertionError("no CUDA sync")):
+            with WaitDiagnostics(tmp, device="cuda:0", active_steps=1, warmup_steps=0) as diag:
+                diag.before_batch(0)
+                with diagnostic_range("forward"):
+                    torch.ones(2).sum()
+                diag.after_batch(1)
+            summary = json.loads(diag.summary_path.read_text())
+            self.assertEqual(summary["capture_mode"], "host")
+            self.assertIsNone(summary["trace_file"])
+            self.assertFalse(summary["timeline"]["gpu_activity_available"])
+            self.assertEqual(summary["captured_microsteps"], 1)
+            self.assertEqual(json.loads(diag.progress_path.read_text())["event"], "capture_complete")
+
+    def test_progress_is_available_during_warmup_without_timing_it(self):
+        with TemporaryDirectory() as tmp:
+            with WaitDiagnostics(tmp, active_steps=1, warmup_steps=1) as diag:
+                with diagnostic_range("dataloader_iterator_start"):
+                    current = json.loads(diag.progress_path.read_text())
+                    self.assertEqual(current["phase_stack"], ["dataloader_iterator_start"])
+                diag.before_batch(0)
+                with diagnostic_range("data_next_including_h2d"):
+                    current = json.loads(diag.progress_path.read_text())
+                    self.assertEqual(current["phase_stack"], ["data_next_including_h2d"])
+                    self.assertFalse(diag.capturing)
+                self.assertEqual(dict(diag.phases), {})
+            self.assertIsInstance(diagnostic_range("closed"), nullcontext)
+
+    def test_watchdog_dumps_python_stack_without_any_signals(self):
+        with TemporaryDirectory() as tmp:
+            with WaitDiagnostics(tmp, active_steps=1, warmup_steps=0, timeout_seconds=.05) as diag:
+                diag.before_batch(0)
+                with diagnostic_range("blocked_loader"):
+                    time.sleep(.12)
+                diag.after_batch(1)
+            stacks = diag.stacks_path.read_text()
+            self.assertIn("Timeout", stacks)
+            self.assertIn("test_wait_diagnostics.py", stacks)
+            self.assertFalse(diag._watchdog_armed)
 
     def test_exception_exports_partial_and_restores_scope(self):
         with TemporaryDirectory() as tmp:
@@ -205,6 +283,8 @@ class CaptureTests(unittest.TestCase):
                 self.assertEqual(diag.active_steps, 1)
             with self.assertRaises(ValueError):
                 WaitDiagnostics(tmp, active_steps=-1)
+            with self.assertRaises(ValueError):
+                WaitDiagnostics(tmp, mode="invalid")
 
 
 if __name__ == "__main__":

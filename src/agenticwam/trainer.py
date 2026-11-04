@@ -768,7 +768,8 @@ class AgenticWAMTrainer:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
         logger.info("Starting training with max_steps=%d.", self.max_steps)
-        data_iter = iter(self.train_loader)
+        with diagnostic_range("dataloader_iterator_start"):
+            data_iter = iter(self.train_loader)
         self.run_start_step = self.global_step
         self.run_start_time = time.perf_counter()
 
@@ -807,7 +808,8 @@ class AgenticWAMTrainer:
                 self.epoch += 1
                 self.batch_in_epoch = 0
                 self.train_sampler.clear_resume_batch_offset()
-                data_iter = iter(self.train_loader)
+                with diagnostic_range("dataloader_iterator_restart"):
+                    data_iter = iter(self.train_loader)
                 wait_diag.after_batch(self.global_step)
                 continue
 
