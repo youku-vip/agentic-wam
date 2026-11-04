@@ -1,0 +1,2 @@
+def policy_chunk(obs, state, robot, skills):
+    robot.move_arm(side='right', target_pos=[0.2422, 0.1522], target_rpy=[-174.62, -80.28, -1.09])
