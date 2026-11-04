@@ -7,13 +7,13 @@
 # and pretrain_ckpt; text_encoder is needed to embed new instructions).
 
 # ---- model weights ---------------------------------------------------------------------------------
-wan_vae: /path/to/Wan2.2_VAE.pth                  # frozen video VAE (Hugging Face Wan-AI/Wan2.2-TI2V-5B, file Wan2.2_VAE.pth)
-text_encoder: /path/to/Cosmos-Reason1-7B         # instruction encoder (Hugging Face nvidia/Cosmos-Reason1-7B)
-code_model: /path/to/SDAR-1.7B-Chat               # code-expert language body (Hugging Face JetLM/SDAR-1.7B-Chat)
-code_vision: /path/to/Qwen3-VL-2B-Instruct        # frozen vision tower of the code expert (Hugging Face Qwen/Qwen3-VL-2B-Instruct)
+wan_vae: /data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth                  # frozen video VAE (Hugging Face Wan-AI/Wan2.2-TI2V-5B, file Wan2.2_VAE.pth)
+text_encoder: /data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/Cosmos-Reason1-7B         # instruction encoder (Hugging Face nvidia/Cosmos-Reason1-7B)
+code_model: /data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/SDAR-1.7B-Chat               # code-expert language body (Hugging Face JetLM/SDAR-1.7B-Chat)
+code_vision: /data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/Qwen3-VL-2B-Instruct        # frozen vision tower of the code expert (Hugging Face Qwen/Qwen3-VL-2B-Instruct)
 
 # ---- checkpoints a training run starts from --------------------------------------------------------
-pretrain_ckpt: /path/to/agenticwam_pretrain.pt    # the released AgenticWAM pretrained checkpoint (README): foundation of post-training
+pretrain_ckpt: /data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/agenticwam_pretrain.pt    # the released AgenticWAM pretrained checkpoint (README): foundation of post-training
 robotwin_wam_init_ckpt: /path/to/robotwin_wam_init.pt          # starting weights of task=robotwin_wam
 robotwin_hybrid_init_ckpt: /path/to/robotwin_hybrid_init.pt    # starting weights of task=robotwin_hybrid
 
