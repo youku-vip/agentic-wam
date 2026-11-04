@@ -1,0 +1,486 @@
+python build_v3_gripper_code.py \
+    --dataset /data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30 \
+    --open-is-high \
+    --gripper-full-stroke-mm 70 \
+    --knob-axis auto \
+    --knob-max-xyz-drift-m 0.005 \
+    --retreat-min-motion-m 0.015 \
+    --retreat-step-m 0.0015 \
+    --retreat-max-waypoints 3
+
+
+ROOT=/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30
+
+# 替换成服务器上实际的 Cosmos-Reason1-7B 权重目录
+CKPT=/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/Cosmos-Reason1-7B
+
+PYTHONPATH=src python3 \
+  scripts/precompute_cosmos_text_embeds.py \
+  --instructions "$ROOT/cosmos_instructions.txt" \
+  --out-dir "$ROOT/cosmos_text_embeds_cache" \
+  --ckpt "$CKPT" \
+  --max-len 128 \
+  --device cuda
+
+
+PRETRAIN=/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/agenticwam_pretrain.pt
+
+test -f "$PRETRAIN" || { echo "Missing pretrained checkpoint"; exit 1; }
+
+PYTHONPATH=src python3 scripts/launch_train.py \
+  --task posttrain_yam \
+  --nproc 1 \
+  --zero 1 \
+  --dry-run \
+  data=custom \
+  paths.pretrain_ckpt="$PRETRAIN" \
+  batch_size=1 \
+  num_workers=0 \
+  max_steps=2 \
+  log_every=1
+
+local-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
+
+
+
+# 替换为实际的远程 W&B Server 地址
+export WANDB_BASE_URL="http://10.102.108.234:8080"
+
+# 此前设置过 offline，改为在线上传
+export WANDB_MODE=online
+
+# 安全输入 API Key，不会回显在终端
+export WANDB_API_KEY=local-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
+
+# 简单检查服务网络连通性
+curl -I --connect-timeout 10 "$WANDB_BASE_URL"
+
+
+cd /data/algorithm/agentic-wam
+
+# CUDA 环境
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="$CUDA_HOME/bin:$PATH"
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# 模型权重
+PRETRAIN=/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/agenticwam_pretrain.pt
+SDAR=/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/SDAR-1.7B-Chat
+QWEN=/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/Qwen3-VL-2B-Instruct
+WAN_VAE=/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+
+# 四卡 ZeRO-2 训练，W&B 环境变量直接传入进程
+WANDB_BASE_URL="http://10.102.108.234:8080" \
+WANDB_API_KEY="local-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" \
+WANDB_MODE=online \
+PYTHONPATH=src /usr/local/bin/python3.11 \
+  scripts/launch_train.py \
+  --task posttrain_yam \
+  --nproc 4 \
+  --zero 2 \
+  data=custom \
+  paths.pretrain_ckpt="$PRETRAIN" \
+  paths.code_model="$SDAR" \
+  paths.code_vision="$QWEN" \
+  paths.wan_vae="$WAN_VAE" \
+  wandb.enabled=true \
+  wandb.mode=online \
+  wandb.project=agenticwam-air-fryer \
+  wandb.name=aw0-air-fryer-zero2-bs128-v1 \
+  batch_size=6 \
+  gradient_accumulation_steps=8 \
+  num_workers=2 \
+  mixed_precision=bf16 \
+  learning_rate=1e-4 \
+  weight_decay=0.01 \
+  max_grad_norm=1.0 \
+  lr_scheduler_type=cosine \
+  max_steps=3000 \
+  log_every=8 \
+  save_every=500 \
+  eval_every=0 \
+  +save_optimizer_state=true \
+  +keep_last_ckpts=2 \
+  output_dir=./runs/air_fryer_zero2_bs128_v1
+
+
+
+cd /data/algorithm/agentic-wam
+
+/usr/local/bin/python3.11 - <<'PY'
+from pathlib import Path
+import shutil
+
+p = Path("src/agenticwam/models/cosmos_mot/generic_mot.py")
+s = p.read_text()
+
+marker = "AGENTICWAM_MOT_NO_CKPT_EVERY"
+
+if marker in s:
+    print("Partial checkpoint patch already installed.")
+else:
+    edits = [
+        (
+            "from typing import Any, Dict\n",
+            "from typing import Any, Dict\nimport os\n"
+        ),
+        (
+            "    def _mixed_attention(self, q, k, v, attention_mask):",
+            "    def _mixed_attention(self, q, k, v, attention_mask, layer_idx):"
+        ),
+        (
+            "        if self.checkpoint_mixed_attn and self.training:\n"
+            "            return checkpoint(_fwd, q, k, v, use_reentrant=False)",
+            "        # AGENTICWAM_MOT_NO_CKPT_EVERY:\n"
+            "        skip_every = int(os.environ.get('AGENTICWAM_MOT_NO_CKPT_EVERY', '0'))\n"
+            "        use_checkpoint = self.checkpoint_mixed_attn and self.training\n"
+            "        if skip_every > 0 and (layer_idx + 1) % skip_every == 0:\n"
+            "            use_checkpoint = False\n"
+            "        if use_checkpoint:\n"
+            "            return checkpoint(_fwd, q, k, v, use_reentrant=False)"
+        ),
+        (
+            "            mixed = self._mixed_attention(q_cat, k_cat, v_cat, attention_mask)",
+            "            mixed = self._mixed_attention(q_cat, k_cat, v_cat, attention_mask, layer_idx)"
+        ),
+    ]
+
+    for old, new in edits:
+        if s.count(old) != 1:
+            raise RuntimeError(f"Patch anchor not unique or missing: {old[:80]!r}")
+        s = s.replace(old, new, 1)
+
+    backup = p.with_suffix(".py.bak_before_partial_ckpt")
+    shutil.copy2(p, backup)
+    p.write_text(s)
+    print(f"Patch installed. Backup: {backup}")
+
+print("Source patch check: PASS")
+PY
+
+/usr/local/bin/python3.11 -m py_compile \
+  src/agenticwam/models/cosmos_mot/generic_mot.py
+
+
+cd /data/algorithm/agentic-wam
+
+# ===== GPU / CUDA =====
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="$CUDA_HOME/bin:$PATH"
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTHONPATH="$PWD/src"
+export TOKENIZERS_PARALLELISM=false
+
+# ===== 加速配置 =====
+export AGENTICWAM_PHASE_TIMING=0
+
+# MoT 28 层：每 AGENTICWAM_MOT_NO_CKPT_EVERY 层取消 1 层 Attention Checkpoint
+export AGENTICWAM_MOT_NO_CKPT_EVERY=1
+
+# ===== W&B =====
+export WANDB_BASE_URL="http://10.102.108.234:8080"
+export WANDB_MODE=online
+export WANDB_API_KEY="local-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"
+
+# 使用已有登录状态或通过环境变量安全注入 WANDB_API_KEY
+
+# ===== 模型权重 =====
+BASE=/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1
+
+PRETRAIN="$BASE/agenticwam_pretrain.pt"
+SDAR="$BASE/weights/SDAR-1.7B-Chat"
+QWEN="$BASE/weights/Qwen3-VL-2B-Instruct"
+WAN_VAE="$BASE/weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+
+# ===== 训练输出 =====
+OUT=./runs/air_fryer_zero2_bs128_3k_partial_ckpt_v1
+
+mkdir -p "$OUT"
+
+# ===== 硬件检查 =====
+/usr/local/bin/python3.11 - <<'PY'
+import torch
+n = torch.cuda.device_count()
+assert n == 4, f"Expected 4 GPUs, got {n}"
+print("GPU check: PASS", n)
+print("Global batch: 4 GPUs x 6 Micro Batch x 4 Accum = 128")
+PY
+
+# ===== 启动正式训练 =====
+PYTHONPATH=src /usr/local/bin/python3.11 \
+  scripts/launch_train.py \
+  --task posttrain_yam \
+  --nproc 4 \
+  --zero 2 \
+  data=custom \
+  paths.pretrain_ckpt="$PRETRAIN" \
+  paths.code_model="$SDAR" \
+  paths.code_vision="$QWEN" \
+  paths.wan_vae="$WAN_VAE" \
+  model.use_gradient_checkpointing=true \
+  wandb.enabled=true \
+  wandb.mode=online \
+  wandb.project=agenticwam-air-fryer \
+  wandb.name=aw0-bs128-3k-partial-ckpt \
+  wandb.group=air-fryer-v3 \
+  batch_size=6 \
+  gradient_accumulation_steps=4 \
+  num_workers=8 \
+  mixed_precision=bf16 \
+  learning_rate=1e-4 \
+  weight_decay=0.01 \
+  max_grad_norm=1.0 \
+  lr_scheduler_type=cosine \
+  max_steps=3500 \
+  log_every=10 \
+  save_every=500 \
+  eval_every=0 \
+  +save_optimizer_state=true \
+  +keep_last_ckpts=2 \
+  output_dir="$OUT"
+
+
+
+cd /data/algorithm/agentic-wam
+
+NSYS=/usr/local/cuda-12.8/bin/nsys
+
+export AGENTICWAM_PHASE_TIMING=0
+export AGENTICWAM_MOT_NO_CKPT_EVERY=1
+
+# ===== W&B =====
+export WANDB_BASE_URL="http://10.102.108.234:8080"
+export WANDB_MODE=online
+export WANDB_API_KEY="local-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"
+
+BASE=/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1
+PRETRAIN="$BASE/agenticwam_pretrain.pt"
+SDAR="$BASE/weights/SDAR-1.7B-Chat"
+QWEN="$BASE/weights/Qwen3-VL-2B-Instruct"
+WAN_VAE="$BASE/weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+
+# 仅修改实验目录，避免覆盖旧任务
+OUT=./runs/air_fryer_zero2_bs96_3500_nsys_v1
+
+$NSYS launch \
+  --session-new=aw0trace \
+  --trace=cuda,nvtx,osrt,nccl \
+  --sample=none \
+  --cpuctxsw=process-tree \
+  --show-output=true \
+  /usr/local/bin/python3.11 scripts/launch_train.py \
+  --task posttrain_yam \
+  --nproc 4 \
+  --zero 2 \
+  data=custom \
+  paths.pretrain_ckpt="$PRETRAIN" \
+  paths.code_model="$SDAR" \
+  paths.code_vision="$QWEN" \
+  paths.wan_vae="$WAN_VAE" \
+  model.use_gradient_checkpointing=true \
+  wandb.enabled=true \
+  wandb.mode=online \
+  wandb.project=agenticwam-air-fryer \
+  wandb.name=aw0-bs96-3500-nsys \
+  wandb.group=air-fryer-v3 \
+  batch_size=6 \
+  gradient_accumulation_steps=4 \
+  num_workers=8 \
+  mixed_precision=bf16 \
+  learning_rate=1e-4 \
+  weight_decay=0.01 \
+  max_grad_norm=1.0 \
+  lr_scheduler_type=cosine \
+  max_steps=3500 \
+  log_every=10 \
+  save_every=500 \
+  eval_every=0 \
+  +save_optimizer_state=true \
+  +keep_last_ckpts=2 \
+  output_dir="$OUT"
+
+
+/usr/local/bin/python3 - <<'PY'
+import sqlite3
+from collections import defaultdict
+
+db = sqlite3.connect("/tmp/aw0_cuda_trace.sqlite")
+query = """
+SELECT
+    k.deviceId,
+    k.start,
+    k.end,
+    s.value
+FROM CUPTI_ACTIVITY_KIND_KERNEL AS k
+JOIN StringIds AS s ON k.demangledName = s.id
+WHERE LOWER(s.value) LIKE '%nccl%'
+ORDER BY k.start
+"""
+rows = db.execute(query).fetchall()
+
+t0 = db.execute(
+    "SELECT MIN(start) FROM CUPTI_ACTIVITY_KIND_KERNEL"
+).fetchone()[0]
+
+print("=== NCCL kernels by GPU ===")
+groups = defaultdict(list)
+for gpu, start, end, name in rows:
+    groups[gpu].append((start, end))
+
+for gpu, items in sorted(groups.items()):
+    durations = [(e - s) / 1e6 for s, e in items]
+    print(
+        f"GPU {gpu}: count={len(items)}, "
+        f"total={sum(durations):.1f} ms, "
+        f"avg={sum(durations)/len(durations):.1f} ms, "
+        f"min={min(durations):.1f} ms, "
+        f"max={max(durations):.1f} ms"
+    )
+
+print("\n=== Individual NCCL kernel timeline ===")
+print("GPU  Start(s)  Duration(ms)")
+for gpu, start, end, name in rows:
+    print(
+        f"{gpu:3d}  "
+        f"{(start-t0)/1e9:8.3f}  "
+        f"{(end-start)/1e6:12.1f}"
+    )
+
+db.close()
+PY
+
+
+cd /data/algorithm/agentic-wam
+
+CFG=configs/real_post_train/data/custom.yaml
+DATASET=/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30
+
+# 替换为上一步查到的真实路径
+ORDER=/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30/coding_v3/episode_order.json
+
+/usr/local/bin/python3.11 \
+  codegen/posttrain/verify_code_alignment.py \
+  --config "$CFG" \
+  --dataset-root "$DATASET" \
+  --order "$ORDER"
+
+
+cd /data/algorithm/agentic-wam
+
+export CACHE=/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30/policy_code_idx_custom.pt
+export ORDER=/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30/coding_v3/episode_order.json
+
+/usr/local/bin/python3.11 - <<'PY'
+import os
+import json
+import torch
+
+cache = torch.load(
+    os.environ["CACHE"],
+    map_location="cpu",
+    weights_only=False,
+)
+order = json.load(open(os.environ["ORDER"]))
+
+codes = cache["codes"]
+ids = cache["code_id_by_idx"].reshape(-1).tolist()
+
+print("Episodes:", len(order))
+print("Cache frames:", len(ids))
+print("Unique codes:", len(codes))
+
+expected_frames = sum(int(x["length"]) for x in order)
+assert len(ids) == expected_frames, (
+    f"Frame mismatch: cache={len(ids)}, "
+    f"order={expected_frames}"
+)
+
+assert min(ids) >= 0
+assert max(ids) < len(codes)
+
+offset = 0
+stats = []
+examples = []
+
+for ei, ep in enumerate(order):
+    start = int(ep["offset"])
+    length = int(ep["length"])
+
+    assert start == offset, (
+        f"Episode {ei}: offset={start}, expected={offset}"
+    )
+    offset += length
+
+    seq = ids[start:start + length]
+    transitions = [
+        t for t in range(1, length)
+        if seq[t] != seq[t - 1]
+    ]
+    stats.append(len(transitions))
+
+    if transitions and len(examples) < 12:
+        t = transitions[0]
+        examples.append((ei, t, seq[t - 1], seq[t]))
+
+print("Total Code transitions:", sum(stats))
+print("Episodes with no Code transition:",
+      sum(n == 0 for n in stats))
+print("Max transitions in one episode:", max(stats))
+print("Mean transitions per episode:",
+      round(sum(stats) / len(stats), 2))
+
+print("\nExample subtask transitions:")
+for ei, t, old_id, new_id in examples:
+    print(f"\nEpisode {ei}, local frame {t}")
+    print("BEFORE:", repr(codes[old_id][:250]))
+    print("AFTER: ", repr(codes[new_id][:250]))
+
+print("\nINDEX_AND_BOUNDARY_SCAN_OK")
+PY
+
+
+
+cd /data/algorithm/agentic-wam
+
+cp /解压目录/agenticwam_custom34_deploy/*.py deploy/
+
+# 首先验证你的 Transform 是否可逆
+PYTHONPATH=src /usr/local/bin/python3.11 \
+  deploy/test_custom34_transform.py
+
+
+
+cd /data/algorithm/agentic-wam
+
+export PYTHONPATH="$PWD/src:$PWD/deploy"
+export AGENTICWAM_DEPLOY_DTYPE=bf16
+
+# 第一次测试先不启用 RTC
+export AGENTICWAM_FAST_JOINT=0
+export AGENTICWAM_RTC=0
+
+/usr/local/bin/python3.11 deploy/custom34_server.py \
+  --ckpt /data/algorithm/agentic-wam/runs/air_fryer_zero2_bs96_3500_p012_v2/checkpoints/weights/step_002000.pt \
+  --dataset /data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30 \
+  --task posttrain_yam \
+  --data-config custom \
+  --nis 6 \
+  --host 127.0.0.1 \
+  --port 8765
+
+
+python -m environment.deploy_client_exec \
+  --config_path=/data/code/common-tools/config_tools/config_dir/main_config.yaml \
+  --robots.e16.urdf_path=/data/code/wheelrobot3_ros1/src/dual_arm_robot/wheelbot_description/urdf/wheelbot.urdf \
+  --choice=zmq --which_robot=e16 \
+  --env.post_url=ws://http://agenticwam-server-tc-embodiedaibrain-4vrwwo75.toolchain-ei.zvalley.com \
+  --env.num_steps=20000 --rtc.s_min=8 \
+  --env.im_w=424 --env.im_h=240 \
+  --env.obs=robot --env.action_which=both --env.debug=False \
+  --env.infermode=rot6d \
+  --rtc.prompt="The right gripper picks up the pink cake." \
+  --rtc.async_mode=True --rtc.use_rtc=True \
+  --rtc.beta=10.0 --rtc.action_dim=20 --env.max_hz=10
+
