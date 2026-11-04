@@ -22,7 +22,7 @@ def test_relative_stats_local_frame_and_episode_boundaries(tmp_path):
     for ep,n in enumerate([40,35]):
         start=len(rows)
         for f in range(n):
-            st=np.zeros(34,np.float32);st[14]=100*(ep+1);st[17:23]=[0,1,0,-1,0,0];st[26:32]=[1,0,0,0,1,0]
+            st=np.zeros(34,np.float32);st[33]=ep;st[14]=100*(ep+1);st[17:23]=[0,1,0,-1,0,0];st[26:32]=[1,0,0,0,1,0]
             ac=np.r_[st[14:23],st[23:32],st[32:34]].astype(np.float32);ac[0]+=1
             rows.append(dict(index=len(rows),frame_index=f,episode_index=ep,**{'observation.state':st,'action':ac}))
         meta.append(dict(episode_index=ep,dataset_from_index=start,dataset_to_index=len(rows),length=n,
@@ -40,6 +40,27 @@ def test_relative_stats_local_frame_and_episode_boundaries(tmp_path):
     previous=tmp_path/'existing.json';previous.write_text(json.dumps(stats))
     _,report=tool.calculate(tmp_path,stride=1,padding='repeat',max_samples=16,existing=previous)
     assert report['existing_action_preclip_outside_5_fraction']==0
+    project,report=tool.calculate(tmp_path,stride=1,padding='repeat',aggregation='project')
+    assert abs(stats['state']['default']['global_mean'][63]-35/75)<1e-6
+    assert project['state']['default']['global_mean'][63]==.5
+    assert project['action']['default']['global_mean'][63]==.5
+
+
+def test_project_policy_matches_original_torch_formula():
+    import torch
+    rng=np.random.default_rng(42)
+    arrays=[rng.normal(size=(n,32,64)).astype(np.float32) for n in [35,70,40]]
+    acc=tool.ProjectStats()
+    for a in arrays:acc.update(a)
+    out=acc.finish()['default']
+    tensors=[torch.from_numpy(a) for a in arrays]
+    means=torch.stack([a.mean(0) for a in tensors]);vars=torch.stack([a.var(0) for a in tensors])
+    stepmean=means.mean(0);globalmean=means.mean((0,1))
+    assert np.allclose(out['global_mean'],globalmean.numpy(),atol=1e-6)
+    assert np.allclose(out['global_std'],(vars+(means-globalmean)**2).mean((0,1)).sqrt().numpy(),atol=1e-6)
+    assert np.allclose(out['stepwise_std'],(vars+(means-stepmean)**2).mean(0).sqrt().numpy(),atol=1e-6)
+    assert np.allclose(out['stepwise_q01'],torch.stack([torch.quantile(a,.01,dim=0) for a in tensors]).amin(0),atol=1e-6)
+    assert np.allclose(out['stepwise_q99'],torch.stack([torch.quantile(a,.99,dim=0) for a in tensors]).amax(0),atol=1e-6)
 
 
 def test_loader_benchmark_uses_real_video(dataset,capsys):

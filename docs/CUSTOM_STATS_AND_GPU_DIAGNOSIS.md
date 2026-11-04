@@ -2,6 +2,27 @@
 
 本次代码标签去注释/回撤合并没有改变原始state/action或转换器，因此没有自动重算统计。之前提供的dataset_stats_eef64.json已验证64D形状、有限值、hand零槽、归一化初始化，但没有用原始Parquet复算，不足以证明统计来自正确的相对动作。
 
+## 新旧统计差异：先匹配原项目聚合口径
+
+原项目BaseLerobotDataset.get_dataset_stats有明确的聚合约定：先算每个episode的统计，再对episode均值等权平均；标准差合并episode内的无偏方差和episode均值间方差。q01取各episode q01的最小值，q99取最大值，是覆盖各轨迹的边界，不是全局真正的1%/99%分位数。
+
+本工具最初默认pooled策略：每帧/窗口等权，分位数按合并分布估计。两者的均值、标准差和分位数可以不同，即使min/max完全一致。这种差异不能直接证明旧统计错误，也不能归咎于相对动作变换。夹爪保持绝对值，夹爪均值不同尤其提示加权策略差异。
+
+要严格验证原项目口径，使用更新脚本的--aggregation project：
+
+```bash
+PY=/usr/local/bin/python3.11
+ROOT=/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30
+"$PY" scripts/diagnose_custom_data.py stats --root "$ROOT" \
+  --existing "$ROOT/dataset_stats_eef64.json" \
+  --aggregation project --stride 1 --padding repeat \
+  --out "$ROOT/dataset_stats_eef64.project_policy_check.json"
+```
+
+project模式不做分位数reservoir抽样，--max-samples在此模式不使用。它复现原项目计算定义，但使用float64聚合以减少误差，因此与原float32结果可能有约1e-6量级差异。模式需要每条轨迹至少2帧、stride=1和repeat padding。
+
+如果同口径比较各字段差异降至浮点误差量级，就支持旧统计来自该原项目策略，可继续保留原文件；若仍有明显差异，再检查旧统计生成程序、选择的episode、转换器和输入版本。不要在训练中途仅因pooled统计不同而替换文件，checkpoint的训练/部署应使用一致的归一化。
+
 ## 相对动作的定义
 
 CustomUnifiedEEFTransform以动作块首帧state[t]为基准：

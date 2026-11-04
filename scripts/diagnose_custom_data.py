@@ -16,12 +16,39 @@ from agenticwam.datasets.lerobot.transforms.custom_unified_eef import CustomUnif
 from agenticwam.datasets.lerobot.shared_stats import PooledStats
 
 
-def calculate(root,*,stride=5,padding='repeat',max_samples=20000,episodes=None,existing=None):
+class ProjectStats:
+    """Match BaseLerobotDataset.get_dataset_stats: episode weights and q envelopes."""
+    def __init__(self):
+        self.episodes=[]
+
+    def update(self,values):
+        x=np.asarray(values,dtype=np.float64)
+        if x.ndim==2:x=x[:,None,:]
+        if len(x)<2 or not np.isfinite(x).all():
+            raise ValueError('Original project variance requires >=2 samples per episode')
+        self.episodes.append(dict(min=x.min(0),max=x.max(0),mean=x.mean(0),var=x.var(0,ddof=1),
+                                  q01=np.quantile(x,.01,axis=0),q99=np.quantile(x,.99,axis=0)))
+
+    def finish(self):
+        if not self.episodes:raise ValueError('No episode statistics')
+        e={k:np.stack([r[k] for r in self.episodes]) for k in self.episodes[0]}
+        mean=e['mean'].mean(0);global_mean=e['mean'].mean((0,1))
+        step=dict(min=e['min'].min(0),max=e['max'].max(0),q01=e['q01'].min(0),q99=e['q99'].max(0),
+                  mean=mean,std=np.sqrt((e['var']+(e['mean']-mean)**2).mean(0)))
+        glob=dict(min=step['min'].min(0),max=step['max'].max(0),q01=step['q01'].min(0),q99=step['q99'].max(0),
+                  mean=global_mean,std=np.sqrt((e['var']+(e['mean']-global_mean)**2).mean((0,1))))
+        return {'default':{**{f'stepwise_{k}':v.tolist() for k,v in step.items()},
+                           **{f'global_{k}':v.tolist() for k,v in glob.items()}}}
+
+
+def calculate(root,*,stride=5,padding='repeat',max_samples=20000,episodes=None,existing=None,aggregation='pooled'):
+    if aggregation=='project' and (stride!=1 or padding!='repeat'):
+        raise ValueError('Project policy requires --stride 1 --padding repeat')
     rd=V3EpisodeReader(root)
     selected=rd.episode_ids if episodes is None else list(dict.fromkeys(episodes))
     tf=CustomUnifiedEEFTransform(['default'])
-    state_acc=PooledStats(max_samples=max_samples,seed=42)
-    action_acc=PooledStats(max_samples=max_samples,seed=42)
+    state_acc=ProjectStats() if aggregation=='project' else PooledStats(max_samples=max_samples,seed=42)
+    action_acc=ProjectStats() if aggregation=='project' else PooledStats(max_samples=max_samples,seed=42)
     frames=windows=0;error=0.;rotation_error=0.;saturated=0;norm_count=0
     norm=None
     if existing:
@@ -47,13 +74,16 @@ def calculate(root,*,stride=5,padding='repeat',max_samples=20000,episodes=None,e
         frames+=len(st)
         stop=len(st) if padding=='repeat' else max(0,len(st)-31)
         starts=np.arange(0,stop,stride)
+        episode_actions=[]
         for offset in range(0,len(starts),128):
             cur=starts[offset:offset+128]
             indices=np.minimum(cur[:,None]+np.arange(32)[None],len(st)-1)
             raw=torch.from_numpy(ac[indices])
             batch=tf.forward({'state':{'default':torch.from_numpy(st[cur,None].copy())},'action':{'default':raw.clone()}})
             rel=batch['action']['default']
-            action_acc.update(rel.numpy());windows+=len(cur)
+            if aggregation=='project':episode_actions.append(rel.numpy().copy())
+            else:action_acc.update(rel.numpy())
+            windows+=len(cur)
             decoded=tf.backward_action20({'state':{'default':batch['state']['default']},'action':{'default':rel.clone()}})['action']['default']
             dims=[0,1,2,9,10,11,18,19]
             error=max(error,float((decoded[...,dims]-raw[...,dims]).abs().max()))
@@ -65,17 +95,21 @@ def calculate(root,*,stride=5,padding='repeat',max_samples=20000,episodes=None,e
                 active=list(range(9))+[31]+list(range(32,41))+[63]
                 z=z[...,active]
                 saturated+=int((z.abs()>5).sum());norm_count+=z.numel()
+        if aggregation=='project':action_acc.update(np.concatenate(episode_actions,axis=0))
     if error>1e-4 or rotation_error>1e-4:
         raise ValueError(f'Relative action roundtrip failed: xyz/gripper={error}, rotation matrix={rotation_error}')
     stats=dict(state=state_acc.finish(),action=action_acc.finish(),num_episodes=len(selected),num_transition=frames)
     stats['custom_relative_provenance']=dict(root=str(rd.root),horizon=32,stride=stride,padding=padding,
-        quantile_reservoir=max_samples,seed=42,action_windows=windows,episodes=selected,
+        aggregation=aggregation,quantile_reservoir=max_samples if aggregation=='pooled' else None,
+        seed=42,action_windows=windows,episodes=selected,
         transform='CustomUnifiedEEFTransform: base=state[t], inverse Rbase',
         transform_sha256=hashlib.sha256(Path(sys.modules[CustomUnifiedEEFTransform.__module__].__file__).read_bytes()).hexdigest())
     report=dict(episodes=len(selected),frames=frames,action_windows=windows,
                 max_xyz_gripper_roundtrip_error=error,max_rotation_matrix_roundtrip_error=rotation_error,
                 existing_action_preclip_outside_5_fraction=saturated/norm_count if norm_count else None,
-                note='All moments cover scanned values. Quantiles use reservoir unless max-samples=0. Different sampling/padding policies can differ without being a defect.')
+                aggregation=aggregation,
+                note=('Original project policy: equal episode weights, unbiased per-episode variance, min episode q01/max episode q99. Float64 aggregation may differ slightly from original float32.' if aggregation=='project' else
+                      'All moments cover scanned values. Quantiles use reservoir unless max-samples=0. Different sampling/padding policies can differ without being a defect.'))
     if existing:
         old=json.loads(Path(existing).read_text())
         report['max_absolute_stat_difference']={}
@@ -117,6 +151,7 @@ def main():
     s.add_argument('--existing',type=Path);s.add_argument('--out',type=Path,required=True)
     s.add_argument('--stride',type=int,default=5);s.add_argument('--padding',choices=['repeat','valid'],default='repeat')
     s.add_argument('--max-samples',type=int,default=20000);s.add_argument('--episodes',type=int,nargs='+')
+    s.add_argument('--aggregation',choices=['pooled','project'],default='pooled',help='project reproduces original episode-weighted normalization policy')
     b=sub.add_parser('loader');b.add_argument('--root',type=Path,required=True)
     b.add_argument('--batch-size',type=int,default=2);b.add_argument('--workers',type=int,default=4)
     b.add_argument('--batches',type=int,default=16);b.add_argument('--warmup',type=int,default=2)
@@ -126,7 +161,7 @@ def main():
         if a.stride<1 or a.max_samples<0:p.error('stride>=1 and max-samples>=0 required')
         report_path=a.out.with_suffix(a.out.suffix+'.report.json')
         if a.out.exists() or report_path.exists():raise ValueError('Choose new output paths; existing stats never overwritten')
-        stats,report=calculate(a.root,stride=a.stride,padding=a.padding,max_samples=a.max_samples,episodes=a.episodes,existing=a.existing)
+        stats,report=calculate(a.root,stride=a.stride,padding=a.padding,max_samples=a.max_samples,episodes=a.episodes,existing=a.existing,aggregation=a.aggregation)
         a.out.parent.mkdir(parents=True,exist_ok=True)
         a.out.write_text(json.dumps(stats,allow_nan=False),encoding='utf-8')
         report_path.write_text(json.dumps(report,indent=2,allow_nan=False),encoding='utf-8')
