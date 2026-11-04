@@ -13,7 +13,7 @@ class Logger:
     def __getattr__(self,name):return lambda *args,**kwargs:None
 
 
-def execute(*,steps=40,stale_grip=False,done_every=False,switch_and_fail=False,pause_same_prompt=False):
+def execute(*,steps=40,stale_grip=False,done_every=False,switch_and_fail=False,pause_same_prompt=False,pause_replay=False):
     tree=ast.parse(SOURCE.read_text())
     main=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='main')
     selected=[n for n in main.body if isinstance(n,(ast.ClassDef,ast.AsyncFunctionDef))
@@ -56,12 +56,18 @@ def execute(*,steps=40,stale_grip=False,done_every=False,switch_and_fail=False,p
         def suppress_rtc_next(self):pass
         async def stop(self):self.stopped=True
     rtc=Client()
+    replay_checks=[2]
+    def replaying():
+        if pause_replay and env.primary==5 and replay_checks[0]:
+            replay_checks[0]-=1
+            return True
+        return False
     async def thread(fn,*args,**kwargs):return fn(*args,**kwargs)
     async def sleep(_):pass
     async def get_obs():return env.get_obs()
     namespace=dict(asyncio=SimpleNamespace(to_thread=thread,sleep=sleep),np=np,
                    time=__import__('time'),logger=Logger(),env=env,rtc=rtc,shared_prompt=shared,
-                   replay_ctrl=SimpleNamespace(is_replaying=lambda:False),
+                   replay_ctrl=SimpleNamespace(is_replaying=replaying),
                    get_obs_with_retry=get_obs,trans_utils=SimpleNamespace(rot6d_to_euler_angle=lambda _:np.zeros(3)),
                    cfg=SimpleNamespace(env=SimpleNamespace(num_steps=steps,max_hz=0)))
     exec(compile(ast.Module(body=selected,type_ignores=[]),str(SOURCE),'exec'),namespace)
@@ -100,3 +106,10 @@ def test_same_prompt_clear_resume_resets_remote_and_gripper_latch():
     assert rtc.resets==1 and rtc.calls==3 and len(env.commands)==40
     assert env.commands[4]['gripper_positions']==['close','close']
     assert env.commands[5]['gripper_positions']==['open','open']
+
+
+def test_sync_checks_replay_between_commands():
+    env,rtc=execute(pause_replay=True)
+    assert rtc.resets==1 and rtc.calls==3
+    assert [c['ee_pos_quat'][0] for c in env.commands[:5]]==[1]*5
+    assert env.commands[5]['ee_pos_quat'][0]==2

@@ -66,6 +66,8 @@ class FakeServer(BaseHTTPRequestHandler):
         FakeServer.stats.append(data)
         time.sleep(FakeServer.delay_s)
         chunk=np.zeros((32,20),np.float32)
+        chunk[:,3:9]=[1,0,0,0,1,0]
+        chunk[:,12:18]=[1,0,0,0,1,0]
         chunk[:,0]=np.arange(32)+10
         if 'committed' in data:
             c=np.asarray(data['committed'],np.float32)

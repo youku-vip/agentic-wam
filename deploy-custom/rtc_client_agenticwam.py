@@ -46,8 +46,9 @@ def normalize_http_base_url(uri: str) -> str:
         raw = "http://" + raw
     parsed = urlparse(raw)
     scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
-#    if scheme not in ("http", "https") or not parsed.hostname or not parsed.port:
-#        raise ValueError(f"expected http://host:port, got {uri!r}")
+    if scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError('Expected an HTTP(S) server URL with a hostname')
+    _ = parsed.port  # Validate optional port; standard 80/443 need not be explicit.
     if parsed.path not in ("", "/", "/act"):
         logger.warning("[HTTP] ignoring old WebSocket path %s; HTTP server uses /act", parsed.path)
     base = f"{scheme}://{parsed.netloc}"
@@ -60,8 +61,11 @@ def encode_png_b64(img: np.ndarray) -> str:
     """HxW RGB uint8 -> PNG/base64 for the custom34 HTTP server."""
     from PIL import Image
 
+    img = np.asarray(img)
+    if img.dtype != np.uint8 or img.ndim != 3 or img.shape[2] != 3:
+        raise ValueError('Camera image must be uint8 HxWx3 RGB; no implicit dtype conversion')
     buf = io.BytesIO()
-    Image.fromarray(np.asarray(img, dtype=np.uint8)).save(buf, format="PNG")
+    Image.fromarray(img).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
@@ -97,6 +101,13 @@ def convert_obs(obs: Dict[str, Any]) -> Dict[str, Any]:
     转换来自环境的观测数据格式，以匹配模型要求
     """
     dst_obs = defaultdict(dict)
+    joints = np.asarray(obs['joint_positions'], dtype=np.float32)
+    pose = np.asarray(obs['ee_pos_quat'], dtype=np.float32)
+    grips = obs.get('gripper_position')
+    if joints.ndim != 1 or len(joints) < 14 or pose.shape != (12,) or not np.isfinite(joints).all() or not np.isfinite(pose).all():
+        raise ValueError('Expected finite joint_positions[>=14] and two xyz/euler poses [12]')
+    if not isinstance(grips, (list, tuple, np.ndarray)) or len(grips) != 2 or any(g not in ('open', 'close', 'closed') for g in grips):
+        raise ValueError('Unknown gripper state; refusing to interpret missing feedback as closed')
     state_np = np.zeros((34,), dtype=np.float32)
     state_np[:14] = obs["joint_positions"][:14]
     state_np[14:17] = obs["ee_pos_quat"][:3]
@@ -375,6 +386,7 @@ class RTCClient:
         self.rtc_freeze_margin = max(0, int(os.environ.get("AGENTICWAM_RTC_FREEZE_MARGIN", "2")))
         self._server_rtc = False
         self._server_prompt: str | None = None
+        self._server_id: str | None = None
         self._request_lock = asyncio.Lock()  # one model, do not overlap /act and /reset
 
         self.save_viz = self.use_async
@@ -437,6 +449,7 @@ class RTCClient:
 
     async def _handshake(self) -> None:
         health = await self._request("GET", "/health")
+        self._observe_server(health)
         if health.get("status") != "success":
             raise ConnectionError(f"GET /health failed: {health}")
         for name, expected in (("state_dim", 34), ("action_dim", 20), ("model_dim", 64)):
@@ -461,15 +474,24 @@ class RTCClient:
             actual_h, self._server_rtc,
         )
         reset = await self._request("POST", "/reset", {})
+        self._observe_server(reset)
         if reset.get("status") != "success":
             raise ConnectionError(f"POST /reset failed: {reset}")
         self._server_prompt = None
         logger.warning("[HTTP] remote episode reset OK")
 
+    def _observe_server(self, result: dict) -> None:
+        server_id = result.get('server_id')
+        if server_id:
+            if self._server_id is not None and self._server_id != server_id:
+                logger.warning('[HTTP] backend instance changed: {} -> {}; check server restart/replicas/session routing', self._server_id, server_id)
+            self._server_id = str(server_id)
+
     async def reset_episode(self) -> None:
         """Reset remote episode while serialized with inference requests."""
         async with self._request_lock:
             result = await self._request("POST", "/reset", {})
+            self._observe_server(result)
             if result.get("status") != "success":
                 raise ConnectionError(f"POST /reset failed: {result}")
             self._server_prompt = None
@@ -531,6 +553,7 @@ class RTCClient:
                 self._server_prompt = None
             start = time.monotonic()
             result = await self._request("POST", "/act", payload)
+            self._observe_server(result)
             self._last_latency_ms = 1000 * (time.monotonic() - start)
             if result.get("status") == "success":
                 self._server_prompt = instruction
@@ -1127,8 +1150,8 @@ def main(cfg: BaseConfig):
                     break
                 # 指令清空或任务切换：立刻停止旧 chunk，重新采集观测/全量规划。
                 current_prompt = shared_prompt.get()
-                if not current_prompt or current_prompt != rtc.prompt:
-                    logger.warning("[PROMPT] instruction changed/cleared; abort old chunk")
+                if not current_prompt or current_prompt != rtc.prompt or replay_ctrl.is_replaying():
+                    logger.warning("[CONTROL] instruction changed/cleared or replay active; abort old chunk")
                     was_idle = True
                     episode_reset_pending = True
                     needs_episode_anchor = True

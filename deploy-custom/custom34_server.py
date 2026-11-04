@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]  # file must be at <repo>/deploy/cust
 ROOT = Path(os.environ.get("AGENTICWAM_ROOT", str(ROOT))).resolve()
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "robotwin" / "deploy"))
+sys.path.insert(0, str(ROOT / "deploy"))
 
 LOG = logging.getLogger("agenticwam.custom34")
 Image.MAX_IMAGE_PIXELS = 16_000_000
@@ -55,7 +57,15 @@ def check_state(obj: Any) -> np.ndarray:
     v = np.asarray(obj, dtype=np.float32)
     if v.shape != (34,) or not np.isfinite(v).all():
         raise ValueError(f"state must contain 34 finite float32 values, got {v.shape}")
+    for offset in (17, 26):
+        check_rotation6d(v[offset:offset+6])
     return v
+
+
+def check_rotation6d(value: np.ndarray) -> None:
+    first, second = value[..., :3], value[..., 3:6]
+    if (np.linalg.norm(first, axis=-1) < 1e-6).any() or (np.linalg.norm(np.cross(first, second), axis=-1) < 1e-6).any():
+        raise ValueError('rotation6D columns must be nonzero and linearly independent')
 
 
 def check_image(img: np.ndarray, role: str) -> np.ndarray:
@@ -208,9 +218,16 @@ class Custom34Runtime:
         if self.code_log_dir:
             self.code_log_dir.mkdir(parents=True, exist_ok=True)
         self.calls = 0
+        self.server_id = uuid.uuid4().hex
+        self._instruction = None
+        self.code_objective = str(cfg.model.get('code_objective', 'joint'))
+        self.history_modes = [name for name in ('AGENTICWAM_SLICE_MODE', 'AGENTICWAM_SLICE_SUMMARY') if os.environ.get(name)]
         self.policy.reset()
         LOG.info("READY: 34D raw state -> 64D normalized proprio; 64D delta -> 20D absolute EEF")
         LOG.info("camera order %s; chunk=%d; RTC server support=%s", self.cam_order, self.horizon, self.rtc_enabled)
+        LOG.info('instance=%s code_objective=%s fast_joint=%s code_memory=%s history_modes=%s',
+                 self.server_id, self.code_objective, self.fast_joint,
+                 bool(getattr(self.policy.model, 'code_memory_enabled', False)), self.history_modes)
 
     def _prepare_rtc(self, raw_state: np.ndarray, body: dict):
         """Optional *inference-only* inpainting guidance. Caller must time-align committed rows.
@@ -228,6 +245,8 @@ class Custom34Runtime:
         rows = np.asarray(body["committed"], dtype=np.float32)
         if rows.ndim != 2 or rows.shape[1] != 20 or not np.isfinite(rows).all():
             raise ValueError("committed must be finite [K,20] absolute EEF targets")
+        for offset in (3, 12):
+            check_rotation6d(rows[:, offset:offset+6])
         k = int(rows.shape[0])
         if not (1 <= k <= min(24, self.horizon-1)):
             raise ValueError(f"committed K must be within 1..{min(24, self.horizon-1)}")
@@ -265,7 +284,17 @@ class Custom34Runtime:
         out = np.asarray(absolute20.numpy(), dtype=np.float32)
         if out.shape != (self.horizon, 20) or not np.isfinite(out).all():
             raise ValueError(f"conversion to raw action20 failed: {out.shape}")
+        for offset in (3, 12):
+            check_rotation6d(out[:, offset:offset+6])
         return out
+
+    def _reset_episode_unlocked(self) -> None:
+        self.policy.reset()
+        self.policy._last_code = None
+        self.policy.model._last_code_canvas = None
+        self.policy.model._rtc_targets = None
+        self.policy.model._rtc_weights = None
+        self._instruction = None
 
     def infer(self, body: dict) -> tuple[np.ndarray, float, str | None]:
         start = time.perf_counter()
@@ -287,22 +316,35 @@ class Custom34Runtime:
         with self.lock:
             staged = False
             try:
+                if self._instruction is not None and self._instruction != instruction:
+                    self._reset_episode_unlocked()
+                # Custom stage labels are observation-dependent. The non-joint
+                # policy's once-per-episode code cache must not pin an old stage.
+                if self.code_objective != 'joint':
+                    self.policy.code_cache.clear()
                 staged = self._prepare_rtc(state, body)
                 predicted_delta64 = self.policy._infer_action_chunk(ob, instruction)
                 action20 = self._delta64_to_abs20(predicted_delta64, state)
                 code = getattr(self.policy, "_last_code", None)
                 self.policy.step_count += 1
                 self.calls += 1
+                self._instruction = instruction
                 if staged:
                     self.rtc_count += 1
                 # Log full newly generated code on EVERY inference, not only episode step 0.
-                print(f"\n===== POLICY CODE | call={self.calls} episode={self.policy.episode_count} "
-                      f"step={self.policy.step_count} =====\n"
-                      f"{code if code is not None else '[NO CODE GENERATED]'}\n"
-                      f"===== END POLICY CODE =====\n", flush=True)
+                try:
+                    print(f"\n===== POLICY CODE | call={self.calls} episode={self.policy.episode_count} "
+                          f"step={self.policy.step_count} =====\n"
+                          f"{code if code is not None else '[NO CODE GENERATED]'}\n"
+                          f"===== END POLICY CODE =====\n", flush=True)
+                except (OSError, ValueError) as exc:
+                    LOG.warning('Console code log failed after successful inference: %s', exc)
                 if self.code_log_dir is not None:
                     path = self.code_log_dir / f"episode{self.policy.episode_count:04d}_call{self.calls:06d}.txt"
-                    path.write_text(str(code) if code is not None else "", encoding="utf-8")
+                    try:
+                        path.write_text(str(code) if code is not None else "", encoding="utf-8")
+                    except OSError as exc:
+                        LOG.warning('Code log write failed after successful inference: %s', exc)
             finally:
                 # RTC staging must NEVER leak into later requests.
                 self.policy.model._rtc_targets = None
@@ -312,9 +354,7 @@ class Custom34Runtime:
 
     def reset(self) -> None:
         with self.lock:
-            self.policy.reset()
-            self.policy.model._rtc_targets = None
-            self.policy.model._rtc_weights = None
+            self._reset_episode_unlocked()
 
 
 class InferenceServer(ThreadingHTTPServer):
@@ -387,7 +427,11 @@ def main():
                                  "input_camera_order": rt.cam_order, "model_dim": 64,
                                  "action_dim": 20, "chunk_size": rt.horizon,
                                  "calls": rt.calls, "rtc_enabled": rt.rtc_enabled,
-                                 "rtc_guided_calls": rt.rtc_count})
+                                 "rtc_guided_calls": rt.rtc_count, "server_id": rt.server_id,
+                                 "episode_count": rt.policy.episode_count,
+                                 "code_objective": rt.code_objective, "fast_joint": rt.fast_joint,
+                                 "code_memory": bool(getattr(rt.policy.model, 'code_memory_enabled', False)),
+                                 "history_modes": rt.history_modes})
 
         def do_POST(self):
             t0 = time.perf_counter()
@@ -404,11 +448,13 @@ def main():
                     rt.reset()
                     return self.send_json(200, {"status":"success", "action": None,
                                                 "latency": round(1000*(time.perf_counter()-t0), 2),
-                                                "message": "episode reset"})
+                                                "message": "episode reset", "server_id": rt.server_id,
+                                                "episode_count": rt.policy.episode_count})
                 action, _, _ = rt.infer(body)
                 return self.send_json(200, {"status": "success", "action": action.tolist(),
                                             "latency": round(1000*(time.perf_counter()-t0), 2),
-                                            "message": ""})
+                                            "message": "", "server_id": rt.server_id,
+                                            "episode_count": rt.policy.episode_count})
             except (ValueError, KeyError, TypeError) as exc:
                 LOG.warning("invalid inference request: %s", exc)
                 return self.send_error_response(400, str(exc), 1000*(time.perf_counter()-t0))
