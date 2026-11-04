@@ -729,7 +729,8 @@ class AgenticWAMTrainer:
             try:
                 _t0 = time.perf_counter()
                 sample = next(data_iter)
-                _ph["data"] += time.perf_counter() - _t0
+                if _measuring():
+                    _ph["data"] += time.perf_counter() - _t0
                 self.batch_in_epoch += 1
             except StopIteration:
                 self.epoch += 1
@@ -830,7 +831,7 @@ class AgenticWAMTrainer:
                         description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
                             current_lr,
                             steps_per_sec,
-                            steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            steps_per_sec * self.batch_size * self.accelerator.num_processes * self.gradient_accumulation_steps,
                             eta_str,
                         )
                         _n = max(_ph["n"], 1)
@@ -862,7 +863,7 @@ class AgenticWAMTrainer:
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
-                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes * self.gradient_accumulation_steps,
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
