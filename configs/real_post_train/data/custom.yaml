@@ -79,6 +79,7 @@ data:
     cosmos_text_cache_dir: ${data.dataset_root}/cosmos_text_embeds_cache
     processor:
       _target_: agenticwam.datasets.lerobot.processors.agenticwam_processor.AgenticWAMProcessor
+      image_resize_mode: stretch  # letterbox: keep aspect ratio and centre-pad
       shape_meta: ${data.train.shape_meta}
       num_obs_steps: ${data.train.num_frames}
       num_output_cameras: 3
@@ -172,6 +173,7 @@ data:
     cosmos_text_cache_dir: ${data.dataset_root}/cosmos_text_embeds_cache
     processor:
       _target_: agenticwam.datasets.lerobot.processors.agenticwam_processor.AgenticWAMProcessor
+      image_resize_mode: stretch  # letterbox: keep aspect ratio and centre-pad
       shape_meta: ${data.train.shape_meta}
       num_obs_steps: ${data.train.num_frames}
       num_output_cameras: 3

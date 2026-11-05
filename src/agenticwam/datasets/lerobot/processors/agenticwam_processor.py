@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Dict, Any, Optional, List, Literal
 
 import torch
@@ -8,6 +9,7 @@ from ..utils.normalizer import LinearNormalizer, NormMode
 from agenticwam.utils.pytorch_utils import dict_apply
 from agenticwam.utils.logging_config import get_logger
 from .base_processor import BaseProcessor
+from ..transforms.image import configure_image_resize
 
 logger = get_logger(__name__)
 
@@ -44,6 +46,7 @@ class AgenticWAMProcessor(BaseProcessor):
         # "zeros" (blank views) or "repeat" (cycle the available views; single-camera ego data)
         camera_padding: Literal["zeros", "repeat"] = "zeros",
         num_image_steps: Optional[int] = None,
+        image_resize_mode: Literal["stretch", "letterbox"] = "stretch",
     ):
         assert camera_padding in ("zeros", "repeat"), camera_padding
         self.camera_padding = camera_padding
@@ -58,8 +61,10 @@ class AgenticWAMProcessor(BaseProcessor):
         self.use_zh_instruction = use_zh_instruction
 
         # image
-        self.train_transforms = train_transforms
-        self.val_transforms = val_transforms
+        self.image_resize_mode = image_resize_mode
+        self.train_transforms = configure_image_resize(train_transforms, image_resize_mode)
+        self.val_transforms = configure_image_resize(val_transforms, image_resize_mode)
+        logger.info("[image-preproc] mode=%s; train and val image transforms configured", image_resize_mode)
 
         self._is_train = None
 
@@ -120,6 +125,14 @@ class AgenticWAMProcessor(BaseProcessor):
     def eval(self):
         self._is_train = False
         return self
+
+    def transform_image(self, image, key):
+        """Shared per-camera pixel transform for the dataset and deployment."""
+        transforms = self.train_transforms if self.is_train else self.val_transforms
+        current_transforms = transforms[key] if isinstance(transforms, Mapping) else transforms
+        for transform in current_transforms:
+            image = transform(image)
+        return image
 
     def set_normalizer_from_stats(self, dataset_stats: Dict[str, Any] = None):
         self._normalizer = LinearNormalizer(
@@ -231,11 +244,8 @@ class AgenticWAMProcessor(BaseProcessor):
             image = data["images"][key]  # [num_obs_steps, C, H, W]
             assert image.ndim == 4, f"Expected 4 dimensions (num_obs_steps, C, H, W), got shape {image.shape}"
             
-            # Apply transforms efficiently on the merged batch
-            transforms = self.train_transforms if self.is_train else self.val_transforms
-            current_transforms = transforms[key] if isinstance(transforms, dict) else transforms
-            for trans in current_transforms:
-                image = trans(image)
+            # Apply the same clip transform used by deployment in letterbox mode.
+            image = self.transform_image(image, key)
             
             meta_shape = (self.num_image_steps, *shape)
             assert tuple(image.shape) == meta_shape, \

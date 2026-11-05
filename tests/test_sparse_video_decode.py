@@ -110,8 +110,9 @@ def make_fixture(root):
     return root
 
 
-def build_dataset(root, *, sparse=False, cache_size=0, stride=1, use_environment=False):
-    shape = {"images": [{"key": key, "raw_shape": [3, 48, 64], "shape": [3, 24, 32]} for key in ("head", "left", "right")],
+def build_dataset(root, *, sparse=False, cache_size=0, stride=1, use_environment=False,
+                  image_resize_mode="stretch", image_size=(24, 32)):
+    shape = {"images": [{"key": key, "raw_shape": [3, 48, 64], "shape": [3, *image_size]} for key in ("head", "left", "right")],
              "action": [{"key": "default", "raw_shape": 20, "shape": 64}],
              "state": [{"key": "default", "raw_shape": 34, "shape": 64}]}
     processor = AgenticWAMProcessor(
@@ -119,13 +120,13 @@ def build_dataset(root, *, sparse=False, cache_size=0, stride=1, use_environment
         action_output_dim=64, proprio_output_dim=64,
         action_state_transforms=[CustomUnifiedEEFTransform(keys=["default"])],
         use_stepwise_action_norm=True, norm_default_mode="q01/q99", norm_exception_mode=None,
-        action_state_merger=ConcatLeftAlign(), train_transforms=[ToTensor(), Resize((24, 32))],
-        val_transforms=[ToTensor(), Resize((24, 32))],
+        action_state_merger=ConcatLeftAlign(), train_transforms=[ToTensor(), Resize(image_size)],
+        val_transforms=[ToTensor(), Resize(image_size)], image_resize_mode=image_resize_mode,
     )
     return RobotVideoDataset(
         dataset_dirs=[str(root)], shape_meta=OmegaConf.create(shape), num_frames=33,
         action_video_freq_ratio=4, global_sample_stride=stride, processor=processor,
-        video_size=[24, 32], concat_multi_camera="multiview", pretrained_norm_stats=str(root / "dataset_stats_eef64.json"),
+        video_size=list(image_size), concat_multi_camera="multiview", pretrained_norm_stats=str(root / "dataset_stats_eef64.json"),
         is_training_set=True, val_set_proportion=0, cosmos_text_cache_dir=str(root / "cosmos"), use_policy_code=True,
         policy_code_idx_path=str(root / "code.pt"), save_norm_stats=False,
         sparse_video_decode=None if use_environment else sparse, video_backend="torchcodec",

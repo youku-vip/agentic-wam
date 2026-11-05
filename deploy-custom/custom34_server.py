@@ -136,7 +136,6 @@ class Custom34Runtime:
         if not ckpt.is_file():
             raise FileNotFoundError(f"checkpoint absent: {ckpt} (refusing smoke-mode random actions)")
         os.environ.setdefault("DIFFSYNTH_DOWNLOAD_SOURCE", "huggingface")
-        os.environ.setdefault("AGENTICWAM_EVAL_PREPROC", "parity")
         os.chdir(ROOT)
 
         import torch
@@ -147,6 +146,7 @@ class Custom34Runtime:
         from agenticwam.datasets.lerobot.transforms.custom_unified_eef import (
             CustomUnifiedEEFTransform,
         )
+        from agenticwam.datasets.lerobot.transforms.image import resolve_eval_image_preproc
 
         if args.device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA unavailable but requested {args.device}")
@@ -163,6 +163,11 @@ class Custom34Runtime:
         sm = cfg.data.train.shape_meta
         if [int(x) for x in cfg.data.train.video_size] != [224, 320]:
             raise ValueError("deploy_policy.py fixes the video size to 224x320; training video_size differs")
+        train_resize_mode = str(cfg.data.train.processor.get("image_resize_mode", "stretch"))
+        val_resize_mode = str(cfg.data.val.processor.get("image_resize_mode", "stretch"))
+        if train_resize_mode != val_resize_mode:
+            raise ValueError("train/val processor.image_resize_mode must match for custom deployment")
+        resolve_eval_image_preproc(train_resize_mode, os.environ.get("AGENTICWAM_EVAL_PREPROC", ""))
         if expected_dim(sm.state[0].raw_shape) != 34 or expected_dim(sm.action[0].raw_shape) != 20:
             raise ValueError("training shape_meta must have raw state=34/action=20")
         if expected_dim(sm.state[0].shape) != 64 or expected_dim(sm.action[0].shape) != 64:

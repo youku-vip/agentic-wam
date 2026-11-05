@@ -56,6 +56,7 @@ from agenticwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT  # no
 from agenticwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json  # noqa: E402
 from agenticwam.datasets.dataset_utils import (  # noqa: E402
     ResizeSmallestSideAspectPreserving, CenterCrop, Normalize)
+from agenticwam.datasets.lerobot.transforms.image import resolve_eval_image_preproc  # noqa: E402
 from torchvision.transforms.functional import (  # noqa: E402
     resize as _tv_resize, center_crop as _tv_center_crop)
 
@@ -310,9 +311,9 @@ class AgenticWAMCosmosRobotWinPolicy:
         #                 from the actual input size -- a hardcoded 456x608 silently ZERO-PADS a
         #                 240x320 sim frame instead of erroring.
         #   legacy      : the pre-2026-09-17 behaviour, for reproducing published numbers exactly.
-        _mode = (os.environ.get("AGENTICWAM_EVAL_PREPROC", "").strip().lower() or "parity")
-        if _mode not in ("legacy", "parity", "parity_crop"):
-            raise ValueError(f"AGENTICWAM_EVAL_PREPROC must be legacy|parity|parity_crop, got {_mode!r}")
+        # letterbox uses the processor's exact val transforms, shared with training.
+        _mode = resolve_eval_image_preproc(
+            self.processor.image_resize_mode, os.environ.get("AGENTICWAM_EVAL_PREPROC", ""))
         self._preproc_mode = _mode
         self._preproc_crop = float(os.environ.get("AGENTICWAM_EVAL_PREPROC_CROP", "0.95"))
         logger.info("[preproc] mode=%s%s", self._preproc_mode,
@@ -385,11 +386,17 @@ class AgenticWAMCosmosRobotWinPolicy:
     def _build_obs_video(self, observation: Dict[str, Any]) -> torch.Tensor:
         obs = observation["observation"]
         views = []
-        for cam in _SIM_CAMERA_KEYS[: self.n_cameras]:
+        for index, cam in enumerate(_SIM_CAMERA_KEYS[: self.n_cameras]):
             rgb = np.asarray(obs[cam]["rgb"]).astype(np.uint8)               # [H0,W0,3]
-            views.append(torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0)  # [3,H0,W0] in [0,1]
+            image = torch.from_numpy(rgb).permute(2, 0, 1)
+            if self._preproc_mode == "letterbox":
+                key = self.processor.shape_meta["images"][index]["key"]
+                image = self.processor.transform_image(image.unsqueeze(0), key).squeeze(0)
+            else:
+                image = image.float() / 255.0
+            views.append(image)
         video = torch.stack(views, dim=0)                                    # [nc,3,H0,W0] (time=views)
-        if self._preproc_mode != "legacy":
+        if self._preproc_mode not in ("legacy", "letterbox"):
             # STAGE 1 = processor.train_transforms, reproduced on the raw sim frame.
             if self._preproc_mode == "parity_crop":
                 _h, _w = video.shape[-2], video.shape[-1]

@@ -1,8 +1,11 @@
+import math
 import random
+from collections.abc import Mapping
 
 import torch
 import torch.nn as nn
 import torchvision.transforms as TF
+import torchvision.transforms.functional as F
 
 
 class ToTensor(nn.Module):
@@ -13,6 +16,87 @@ class ToTensor(nn.Module):
         assert x.dtype == torch.uint8
         x = x.to(torch.float32) / 255.0
         return x
+
+
+class LetterboxResize(nn.Module):
+    """Fit a CHW image or TCHW clip into (height, width), then centre-pad.
+
+    One scale is used for both axes. Padding is constant (black by default,
+    before the dataset's [-1, 1] normalization); odd padding goes bottom/right.
+    """
+
+    def __init__(self, size, interpolation=TF.InterpolationMode.BILINEAR,
+                 antialias=True, fill=0.0):
+        super().__init__()
+        if isinstance(size, int) or len(size) != 2:
+            raise ValueError("LetterboxResize requires size=[height, width]")
+        if any(isinstance(v, bool) or int(v) != v or v <= 0 for v in size):
+            raise ValueError("LetterboxResize size must contain two positive integers")
+        if not math.isfinite(fill):
+            raise ValueError("LetterboxResize fill must be finite")
+        self.size = tuple(int(v) for v in size)
+        self.interpolation = interpolation
+        self.antialias = antialias
+        self.fill = float(fill)
+
+    def forward(self, image):
+        if not isinstance(image, torch.Tensor) or image.ndim not in (3, 4):
+            raise ValueError("LetterboxResize expects a CHW image or TCHW clip tensor")
+        height, width = image.shape[-2:]
+        if height <= 0 or width <= 0:
+            raise ValueError("LetterboxResize cannot resize an empty image")
+        target_h, target_w = self.size
+        scale = min(target_h / height, target_w / width)
+        resized_h = max(1, min(target_h, int(height * scale + 0.5)))
+        resized_w = max(1, min(target_w, int(width * scale + 0.5)))
+        image = F.resize(image, [resized_h, resized_w],
+                         interpolation=self.interpolation, antialias=self.antialias)
+        top = (target_h - resized_h) // 2
+        left = (target_w - resized_w) // 2
+        return F.pad(image, [left, top, target_w - resized_w - left,
+                             target_h - resized_h - top], fill=self.fill)
+
+
+def configure_image_resize(transforms, mode):
+    """Replace explicit H/W Resize operations only when letterbox is selected."""
+    if mode not in ("stretch", "letterbox"):
+        raise ValueError(f"image_resize_mode must be stretch|letterbox, got {mode!r}")
+    if mode == "stretch":
+        return transforms
+    if isinstance(transforms, Mapping):
+        return {key: configure_image_resize(value, mode) for key, value in transforms.items()}
+    if transforms is None:
+        raise ValueError("letterbox requires explicit train/val image transforms")
+    result, found = [], False
+    for transform in transforms:
+        if isinstance(transform, TF.Resize):
+            if transform.max_size is not None:
+                raise ValueError("letterbox requires Resize(size=[height, width], max_size=None)")
+            transform = LetterboxResize(transform.size, interpolation=transform.interpolation,
+                                        antialias=transform.antialias)
+        found = found or isinstance(transform, LetterboxResize)
+        result.append(transform)
+    if not found:
+        raise ValueError("letterbox requires Resize(size=[height, width]) in each image transform list")
+    return result
+
+
+def resolve_eval_image_preproc(image_resize_mode, requested=""):
+    """Keep deployment geometry aligned with its configured training recipe."""
+    if image_resize_mode not in ("stretch", "letterbox"):
+        raise ValueError(f"Unknown image_resize_mode: {image_resize_mode!r}")
+    requested = str(requested or "").strip().lower()
+    if requested in ("", "auto"):
+        requested = "letterbox" if image_resize_mode == "letterbox" else "parity"
+    if requested not in ("legacy", "parity", "parity_crop", "letterbox"):
+        raise ValueError("AGENTICWAM_EVAL_PREPROC must be auto|legacy|parity|parity_crop|letterbox")
+    if (requested == "letterbox") != (image_resize_mode == "letterbox"):
+        raise ValueError(
+            "Deployment preprocessing disagrees with processor.image_resize_mode; "
+            "use the training image_resize_mode and AGENTICWAM_EVAL_PREPROC=auto"
+        )
+    return requested
+
 
 class Pad(nn.Module):
     def __init__(self, padding, fill=0, padding_mode='constant'):

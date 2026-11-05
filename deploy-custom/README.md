@@ -44,6 +44,8 @@ CUDA_VISIBLE_DEVICES=0 python deploy/custom34_server.py \
   --host 127.0.0.1 --port 8765
 ```
 
+若 checkpoint 采用 `image_resize_mode: letterbox` 训练，改用 `export AGENTICWAM_EVAL_PREPROC=auto`，并保持训练/验证 processor 配置与对应训练一致。服务端会调用共享的等比例缩放补边变换。安装和回退见 [图像比例修复](../docs/CUSTOM_IMAGE_LETTERBOX.md)。
+
 上例在 GPU 本机测试。若机器人在另外一台可信内网机器，服务器需通过受保护的端口/SSH 隧道可达；直接监听 `0.0.0.0` 时必须在防火墙限制客户端源地址，不能无认证暴露公网。**没有 Token 或 Authorization 要求**。
 
 按你的实际训练任务名、checkpoint、stats 和 `model.infer_code_tokens` 设置启动参数。每次 `POST /act` 时服务端打印完整 POLICY CODE，并按 `--code-log-dir` 写文件。
