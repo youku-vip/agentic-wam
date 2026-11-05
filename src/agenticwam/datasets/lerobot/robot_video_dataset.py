@@ -221,11 +221,33 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.lerobot_dataset)
 
+    def get_task_sampling_index(self):
+        if not hasattr(self, "_sampling_index_cache"):
+            from .task_sampling import build_task_sampling_index
+            self._sampling_index_cache = build_task_sampling_index(self)
+        return self._sampling_index_cache
+
+    def enable_task_balanced_sampling(self, task_index=None):
+        self._balanced_task_index = task_index if task_index is not None else self.get_task_sampling_index()
+        self._balanced_task_groups = [np.flatnonzero(self._balanced_task_index.task_ids == task)
+                                      for task in range(len(self._balanced_task_index.task_names))]
+        self.lerobot_dataset.strict_sample_indices = True
+
+    def _retry_sample_index(self, index):
+        balanced = getattr(self, "_balanced_task_index", None)
+        if balanced is None:
+            return int(np.random.randint(len(self)))
+        group = self._balanced_task_groups[int(balanced.task_ids[int(index)])]
+        return int(group[np.random.randint(len(group))])
+
     def _get(self, idx):
         sample_idx = idx
         sample = None
         for attempt in range(self.max_padding_retry + 1):
             sample = self.lerobot_dataset[sample_idx]
+            balanced = getattr(self, "_balanced_task_index", None)
+            if balanced is not None and balanced.task_ids[int(sample["idx"])] != balanced.task_ids[int(idx)]:
+                raise RuntimeError("Loader changed the task of a balanced sample")
 
             if not self.skip_padding_as_possible:
                 break
@@ -244,7 +266,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             if not has_pad or attempt >= self.max_padding_retry:
                 break
 
-            sample_idx = np.random.randint(len(self.lerobot_dataset))
+            sample_idx = self._retry_sample_index(idx)
         
         image_is_pad = sample["image_is_pad"]
 
@@ -399,6 +421,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                                                 # skill-only block wins and the event log vanishes
             data["code_history"] = hist_txt
             data["prompt_nohist"] = prompt_nh
+        if getattr(self, "_balanced_task_index", None) is not None:
+            data["sampling_task_id"] = int(self._balanced_task_index.task_ids[int(sample["idx"])])
         return data
 
     def _get_code_slice(self, task: str, idx: int, episode_index=None):
@@ -512,12 +536,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         for _attempt in range(25):
-            _use = idx if _attempt == 0 else int(np.random.randint(len(self)))
+            _use = idx if _attempt == 0 else self._retry_sample_index(idx)
             try:
                 return self._get(_use)
             except Exception as e:
                 if _attempt == 0:
-                    print(f"Error processing sample idx {idx}: {e}. Retrying with random samples.")
+                    scope = "samples from the same task" if getattr(self, "_balanced_task_index", None) is not None else "random samples"
+                    print(f"Error processing sample idx {idx}: {e}. Retrying with {scope}.")
                 if _attempt >= 24:
                     raise
         raise RuntimeError("unreachable")

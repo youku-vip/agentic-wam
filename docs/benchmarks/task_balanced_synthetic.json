@@ -1,0 +1,67 @@
+{
+  "passed": true,
+  "task_names": {
+    "0": "task-0",
+    "1": "task-1",
+    "2": "task-2",
+    "3": "task-3"
+  },
+  "raw_frame_counts": [
+    12,
+    17,
+    22,
+    27
+  ],
+  "raw_frame_fractions": [
+    0.15384615384615385,
+    0.21794871794871795,
+    0.28205128205128205,
+    0.34615384615384615
+  ],
+  "checked_microbatches_per_rank": 16,
+  "expected_per_rank_microbatch": {
+    "0": 1,
+    "1": 1,
+    "2": 1,
+    "3": 1
+  },
+  "observed_optimizer_batch_counts": [
+    {
+      "0": 16,
+      "1": 16,
+      "2": 16,
+      "3": 16
+    },
+    {
+      "0": 16,
+      "1": 16,
+      "2": 16,
+      "3": 16
+    }
+  ],
+  "resume_prefix_check_passed": true,
+  "sampler": {
+    "kind": "task_balanced_v1",
+    "seed": 42,
+    "batch_size": 4,
+    "world_size": 2,
+    "epoch_samples": 128,
+    "gradient_accumulation_steps": 8,
+    "task_names": [
+      "task-0",
+      "task-1",
+      "task-2",
+      "task-3"
+    ],
+    "task_index_sha256": "844e61ec22304f44da3de7a1780d72f9d3984799f3f10aa4650b49aaf07685ff"
+  },
+  "notes": [
+    "Reads selected Parquet task/episode/frame columns only; no video, normalizer or model is loaded.",
+    "Uses the same Accelerate no-split batch sharding as training; does not shard the sampler twice.",
+    "This checks index plans; training logs additionally count actual returned task IDs."
+  ],
+  "synthetic": true,
+  "gpu_used": false,
+  "additional_check": "Two actual CPU/DDP ranks ran the current trainer with GAS=8 for three updates across an epoch boundary; each update had 16 samples per task and weights stayed synchronized.",
+  "limits": "Synthetic metadata and CPU/DDP tests; not a real GPU/ZeRO training run."
+}

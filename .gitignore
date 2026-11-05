@@ -53,6 +53,7 @@ codegen/pretrain/**/.nvinferencekeys
 _deps/
 .torchinductor_cache*/
 .wandb_env
+.training-throughput-backups/
 units_*.txt
 *.tgz
 outputs/

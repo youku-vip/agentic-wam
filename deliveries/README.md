@@ -1,5 +1,7 @@
 # Custom 数据代码审查交付包
 
+四任务均衡采样包：`training-throughput-fixes-v2-task-balanced.zip`，包含原有优化和均衡 batch 功能。开启后，当前双卡 batch=4/GAS=8 下每次更新四任务各 16 个样本。见 [安装和验证](../docs/TASK_BALANCED_BATCHES.md)。
+
 训练等待优化包：`training-throughput-fixes-v1.zip`，包括可选的 DeepSpeed 反向参数计数缓存、图像提前抽帧、worker decoder LRU、只读一致性检查与保留本地配置的安装器。优先阅读 [安装与验证命令](../docs/TRAINING_THROUGHPUT_FIXES.md)。默认不开启优化，需安装后显式设置环境变量。
 
 以下说明对应原始 `custom-data-review.zip`：

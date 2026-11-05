@@ -15,6 +15,8 @@ SOURCE_FILES = (
     "src/agenticwam/utils/deepspeed_graph_count_cache.py",
     "src/agenticwam/utils/wait_diagnostics.py",
     "src/agenticwam/utils/code_metrics.py",
+    "src/agenticwam/utils/samplers.py",
+    "src/agenticwam/datasets/lerobot/task_sampling.py",
     "src/agenticwam/datasets/lerobot/base_lerobot_dataset.py",
     "src/agenticwam/datasets/lerobot/robot_video_dataset.py",
     "src/agenticwam/datasets/lerobot/processors/agenticwam_processor.py",
@@ -22,6 +24,7 @@ SOURCE_FILES = (
     "src/agenticwam/datasets/lerobot/v3/dataset.py",
     "src/agenticwam/datasets/lerobot/decoder_cache.py",
     "scripts/verify_custom_video_decode.py",
+    "scripts/verify_task_balanced_batches.py",
     "scripts/summarize_wait_trace.py",
     "scripts/benchmark_video_decode.py",
 )

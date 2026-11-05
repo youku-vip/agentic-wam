@@ -21,7 +21,7 @@ from .utils.fs import ensure_dir
 from .utils.code_metrics import COUNT_KEYS, probe_code_batch, summarize_code_counts
 from .utils.logging_config import get_logger, setup_logging
 from .utils.pytorch_utils import set_global_seed
-from .utils.samplers import ResumableEpochSampler
+from .utils.samplers import ResumableEpochSampler, TaskBalancedEpochSampler
 from .utils.video_io import save_mp4
 from .utils.video_metrics import pil_frames_to_video_tensor, video_psnr, video_ssim
 from .utils.wait_diagnostics import WaitDiagnostics, diagnostic_range
@@ -236,12 +236,32 @@ class AgenticWAMTrainer:
         self.wandb_run = None
 
     def _build_loader(self, dataset, worker_init_fn=None):
-        self.train_sampler = ResumableEpochSampler(
-            dataset=dataset,
-            seed=self.seed,
-            batch_size=self.batch_size,
-            num_processes=self.accelerator.num_processes,
-        )
+        balance = self.cfg.get("task_balanced_batch")
+        if balance is None:
+            balance = os.environ.get("AGENTICWAM_TASK_BALANCED_BATCH", "0")
+        if str(balance).strip().lower() not in {"0", "1", "false", "true"}:
+            raise ValueError("task_balanced_batch / AGENTICWAM_TASK_BALANCED_BATCH must be bool or 0/1")
+        if str(balance).strip().lower() in {"1", "true"}:
+            if getattr(self.accelerator, "split_batches", False):
+                raise ValueError("Task-balanced local batches require Accelerate split_batches=False")
+            if not hasattr(dataset, "get_task_sampling_index") or not hasattr(dataset, "enable_task_balanced_sampling"):
+                raise TypeError("Task-balanced batches require a dataset with task-aware index and retry support")
+            task_index = dataset.get_task_sampling_index()
+            digest = torch.tensor(list(bytes.fromhex(task_index.sha256)), device=self.accelerator.device, dtype=torch.uint8)
+            digests = self.accelerator.gather(digest).reshape(self.accelerator.num_processes, -1)
+            if not bool(torch.all(digests == digests[0])):
+                raise RuntimeError("Task-to-sample mappings differ across ranks")
+            self.train_sampler = TaskBalancedEpochSampler(
+                dataset, task_index, self.seed, self.batch_size, self.accelerator.num_processes,
+                self.gradient_accumulation_steps)
+            dataset.enable_task_balanced_sampling(task_index)
+            logger.info("[task-balance] enabled tasks=%s raw_frame_counts=%s local_quota=%d epoch_samples=%d",
+                        dict(enumerate(task_index.task_names)), task_index.counts(),
+                        self.train_sampler.per_task_local, self.train_sampler.epoch_samples)
+        else:
+            self.train_sampler = ResumableEpochSampler(
+                dataset=dataset, seed=self.seed, batch_size=self.batch_size,
+                num_processes=self.accelerator.num_processes)
         # Deep prefetch + persistent workers keep a large batch buffer warm so the
         # dataloader does not drain every ~40 steps and stall ~150s on Lustre refill
         # (the periodic multi-node data-starvation stalls). Only valid with workers>0.
@@ -259,6 +279,22 @@ class AgenticWAMTrainer:
             worker_init_fn=worker_init_fn,
             **loader_perf_kwargs,
         )
+
+    def _sampler_descriptor(self):
+        sampler = getattr(self, "train_sampler", None)
+        return sampler.descriptor() if isinstance(sampler, TaskBalancedEpochSampler) else {"kind": "random_v1"}
+
+    def _check_sampler_resume(self, payload):
+        previous = payload.get("sampler")
+        current = self._sampler_descriptor()
+        if previous is None:
+            if current["kind"] == "task_balanced_v1":
+                logger.warning("[task-balance] legacy checkpoint has no sampler recipe; resumed sample order uses the new balanced sampler")
+        elif previous.get("kind") != current["kind"]:
+            logger.warning("[task-balance] sampler mode changed from %s to %s; this changes resumed sample order",
+                           previous.get("kind"), current["kind"])
+        elif current["kind"] == "task_balanced_v1" and previous != current:
+            raise ValueError("Balanced sampler resume requires the same task mapping, seed, batch size, world size and gradient accumulation")
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
         if not hasattr(dataset, "__len__"):
@@ -447,6 +483,7 @@ class AgenticWAMTrainer:
             return
         with open(cand, "r", encoding="utf-8") as f:
             payload = json.load(f)
+        self._check_sampler_resume(payload)
         if "epoch" not in payload or "batch_in_epoch" not in payload:
             logger.warning("Weights-only resume: %s lacks epoch/batch_in_epoch; dataloader restarts at batch 0", cand)
             return
@@ -622,6 +659,7 @@ class AgenticWAMTrainer:
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
+            "sampler": self._sampler_descriptor(),
         }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -660,11 +698,14 @@ class AgenticWAMTrainer:
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
-        self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
+        payload = None
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+            self._check_sampler_resume(payload)
+        self.accelerator.load_state(input_dir=state_dir)
+        if payload is not None:
             self.global_step = int(payload["global_step"])
 
             if "epoch" in payload and "batch_in_epoch" in payload:
@@ -801,6 +842,12 @@ class AgenticWAMTrainer:
             if _measuring() and torch.cuda.is_available():
                 torch.cuda.synchronize()
 
+        balanced_sampler = getattr(self, "train_sampler", None)
+        task_counts = (torch.zeros(balanced_sampler.num_tasks, dtype=torch.long, device=self.accelerator.device)
+                       if isinstance(balanced_sampler, TaskBalancedEpochSampler) else None)
+        task_labels = (torch.arange(task_counts.numel(), device=task_counts.device).reshape(1, -1)
+                       if task_counts is not None else None)
+
         while self.global_step < self.max_steps:
             wait_diag.before_batch(self.global_step)
             try:
@@ -810,6 +857,10 @@ class AgenticWAMTrainer:
                 if _measuring():
                     _ph["data"] += time.perf_counter() - _t0
                 self.batch_in_epoch += 1
+                if task_counts is not None:
+                    # Fixed-size counting avoids a data-dependent CUDA bincount
+                    # allocation / host scalar read in every microstep.
+                    task_counts.add_((sample["sampling_task_id"].reshape(-1, 1) == task_labels).sum(0))
             except StopIteration:
                 self.epoch += 1
                 self.batch_in_epoch = 0
@@ -899,6 +950,9 @@ class AgenticWAMTrainer:
                         grad_norm_tensor = torch.tensor(grad_norm, device=loss.device, dtype=torch.float32)
                         global_grad_norm = float(self.accelerator.gather(grad_norm_tensor).mean().item())
 
+                        global_task_counts = (self.accelerator.reduce(task_counts, reduction="sum").cpu().tolist()
+                                              if task_counts is not None else None)
+
                         current_lr = float(self.optimizer.param_groups[0]["lr"])
 
                     if self.log_every > 0 and self.global_step % self.log_every == 0 and self.accelerator.is_main_process:
@@ -951,6 +1005,11 @@ class AgenticWAMTrainer:
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
+                        if global_task_counts is not None:
+                            logger.info("[task-balance] step=%d last_update_samples=%s", self.global_step,
+                                        dict(enumerate(global_task_counts)))
+                            for task, count in enumerate(global_task_counts):
+                                wandb_payload[f"sampling/task_{task}_samples"] = count
                         graph_counter = getattr(self, "_ds_graph_count_cache", None)
                         if graph_counter is not None:
                             graph_counts = graph_counter.cache_info()
@@ -960,6 +1019,9 @@ class AgenticWAMTrainer:
                             wandb_payload["perf/ds_graph_count_cache_hits"] = graph_counts["hits"]
                         self._wandb_log(wandb_payload)
                         _ph = {"data": 0.0, "skew": 0.0, "fwd": 0.0, "bwd": 0.0, "opt": 0.0, "n": 0, "nopt": 0}
+
+                    if task_counts is not None:
+                        task_counts.zero_()
 
                     if (self.code_eval_every > 0
                             and self.global_step % self.code_eval_every == 0
