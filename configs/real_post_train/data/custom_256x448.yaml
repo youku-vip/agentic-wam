@@ -1,0 +1,203 @@
+# @package _global_
+# Custom LeRobot v3: 34D state / 20D absolute action -> unified 64D.
+# Raw 240x424 images are centre-padded to 256x448 without upscaling.
+# New recipe: task=posttrain_custom data=custom_256x448 (adjust local paths/cache).
+# Existing installations: configure_custom_image_preproc.py can update custom.yaml
+# while preserving coding_v4, skill_prompt_map, statistics and local paths.
+data:
+  dataset_root: /data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30
+  code_cache: ${data.dataset_root}/coding_v3/policy_code_idx_custom.pt
+  skill_prompt_map: null
+  train:
+    _target_: agenticwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+    dataset_dirs: ${lerobot_shards:${data.dataset_root}}
+    shape_meta:
+      images:
+      - key: head
+        raw_shape:
+        - 3
+        - 240
+        - 424
+        shape:
+        - 3
+        - 256
+        - 448
+      - key: left
+        raw_shape:
+        - 3
+        - 240
+        - 424
+        shape:
+        - 3
+        - 256
+        - 448
+      - key: right
+        raw_shape:
+        - 3
+        - 240
+        - 424
+        shape:
+        - 3
+        - 256
+        - 448
+      action:
+      - key: default
+        raw_shape: 20
+        shape: 64
+      state:
+      - key: default
+        raw_shape: 34
+        shape: 64
+    num_frames: 33
+    global_sample_stride: 1
+    action_video_freq_ratio: 4
+    # null: environment override, otherwise the legacy dense/uncached defaults.
+    sparse_video_decode: null
+    video_backend: null
+    video_decoder_cache_size: null
+    video_decoder_num_threads: null
+    video_size:
+    - 256
+    - 448
+    camera_key: null
+    val_set_proportion: 0.0
+    is_training_set: true
+    pretrained_norm_stats: ${data.dataset_root}/dataset_stats_eef64.json
+    skip_padding_as_possible: false
+    concat_multi_camera: multiview
+    use_policy_code: true
+    skill_prompt_only: false
+    skill_prompt_map: ${data.skill_prompt_map}
+    policy_code_coverage: 1.0
+    cosmos_text_cache_dir: ${data.dataset_root}/cosmos_text_embeds_cache
+    processor:
+      _target_: agenticwam.datasets.lerobot.processors.agenticwam_processor.AgenticWAMProcessor
+      image_resize_mode: letterbox  # letterbox: keep aspect ratio and centre-pad
+      image_letterbox_scale_up: false  # false: pad small images without enlarging
+      shape_meta: ${data.train.shape_meta}
+      num_obs_steps: ${data.train.num_frames}
+      num_output_cameras: 3
+      action_output_dim: 64
+      proprio_output_dim: 64
+      action_state_transforms:
+      - _target_: agenticwam.datasets.lerobot.transforms.custom_unified_eef.CustomUnifiedEEFTransform
+        keys:
+        - default
+      use_stepwise_action_norm: true
+      norm_default_mode: q01/q99
+      norm_exception_mode: null
+      action_state_merger:
+        _target_: agenticwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+      train_transforms:
+      - _target_: agenticwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size:
+        - 256
+        - 448
+      val_transforms:
+      - _target_: agenticwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size:
+        - 256
+        - 448
+    context_len: 128
+    episode_indices: null
+    policy_code_idx_path: ${data.code_cache}
+    frame_offset: 0
+  val:
+    _target_: agenticwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
+    dataset_dirs: ${lerobot_shards:${data.dataset_root}}
+    shape_meta:
+      images:
+      - key: head
+        raw_shape:
+        - 3
+        - 240
+        - 424
+        shape:
+        - 3
+        - 256
+        - 448
+      - key: left
+        raw_shape:
+        - 3
+        - 240
+        - 424
+        shape:
+        - 3
+        - 256
+        - 448
+      - key: right
+        raw_shape:
+        - 3
+        - 240
+        - 424
+        shape:
+        - 3
+        - 256
+        - 448
+      action:
+      - key: default
+        raw_shape: 20
+        shape: 64
+      state:
+      - key: default
+        raw_shape: 34
+        shape: 64
+    num_frames: 33
+    global_sample_stride: 1
+    action_video_freq_ratio: 4
+    sparse_video_decode: null
+    video_backend: null
+    video_decoder_cache_size: null
+    video_decoder_num_threads: null
+    video_size:
+    - 256
+    - 448
+    camera_key: null
+    val_set_proportion: 0.0
+    is_training_set: false
+    pretrained_norm_stats: ${data.dataset_root}/dataset_stats_eef64.json
+    skip_padding_as_possible: false
+    concat_multi_camera: multiview
+    use_policy_code: true
+    skill_prompt_only: false
+    skill_prompt_map: ${data.skill_prompt_map}
+    policy_code_coverage: 1.0
+    cosmos_text_cache_dir: ${data.dataset_root}/cosmos_text_embeds_cache
+    processor:
+      _target_: agenticwam.datasets.lerobot.processors.agenticwam_processor.AgenticWAMProcessor
+      image_resize_mode: letterbox  # letterbox: keep aspect ratio and centre-pad
+      image_letterbox_scale_up: false  # false: pad small images without enlarging
+      shape_meta: ${data.train.shape_meta}
+      num_obs_steps: ${data.train.num_frames}
+      num_output_cameras: 3
+      action_output_dim: 64
+      proprio_output_dim: 64
+      action_state_transforms:
+      - _target_: agenticwam.datasets.lerobot.transforms.custom_unified_eef.CustomUnifiedEEFTransform
+        keys:
+        - default
+      use_stepwise_action_norm: true
+      norm_default_mode: q01/q99
+      norm_exception_mode: null
+      action_state_merger:
+        _target_: agenticwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+      train_transforms:
+      - _target_: agenticwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size:
+        - 256
+        - 448
+      val_transforms:
+      - _target_: agenticwam.datasets.lerobot.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Resize
+        size:
+        - 256
+        - 448
+    context_len: 128
+    episode_indices: null
+    policy_code_idx_path: ${data.code_cache}
+    frame_offset: 0
+model:
+  infer_code_tokens: 64

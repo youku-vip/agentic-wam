@@ -111,7 +111,7 @@ def make_fixture(root):
 
 
 def build_dataset(root, *, sparse=False, cache_size=0, stride=1, use_environment=False,
-                  image_resize_mode="stretch", image_size=(24, 32)):
+                  image_resize_mode="stretch", image_size=(24, 32), image_letterbox_scale_up=True):
     shape = {"images": [{"key": key, "raw_shape": [3, 48, 64], "shape": [3, *image_size]} for key in ("head", "left", "right")],
              "action": [{"key": "default", "raw_shape": 20, "shape": 64}],
              "state": [{"key": "default", "raw_shape": 34, "shape": 64}]}
@@ -122,6 +122,7 @@ def build_dataset(root, *, sparse=False, cache_size=0, stride=1, use_environment
         use_stepwise_action_norm=True, norm_default_mode="q01/q99", norm_exception_mode=None,
         action_state_merger=ConcatLeftAlign(), train_transforms=[ToTensor(), Resize(image_size)],
         val_transforms=[ToTensor(), Resize(image_size)], image_resize_mode=image_resize_mode,
+        image_letterbox_scale_up=image_letterbox_scale_up,
     )
     return RobotVideoDataset(
         dataset_dirs=[str(root)], shape_meta=OmegaConf.create(shape), num_frames=33,

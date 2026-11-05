@@ -32,7 +32,7 @@ cp rtc_client_agenticwam.py /path/to/robot_project/rtc_client_agenticwam.py
 ```bash
 cd /data/algorithm/agentic-wam
 export AGENTICWAM_DEPLOY_DTYPE=bf16
-export AGENTICWAM_EVAL_PREPROC=parity
+export AGENTICWAM_EVAL_PREPROC=auto
 export AGENTICWAM_CODE_PIN=0
 CUDA_VISIBLE_DEVICES=0 python deploy/custom34_server.py \
   --ckpt /真实路径/step_003500.pt \
@@ -45,6 +45,8 @@ CUDA_VISIBLE_DEVICES=0 python deploy/custom34_server.py \
 ```
 
 若 checkpoint 采用 `image_resize_mode: letterbox` 训练，改用 `export AGENTICWAM_EVAL_PREPROC=auto`，并保持训练/验证 processor 配置与对应训练一致。服务端会调用共享的等比例缩放补边变换。安装和回退见 [图像比例修复](../docs/CUSTOM_IMAGE_LETTERBOX.md)。
+
+`256×448` 训练与部署的完整切换命令见 [256×448 图像适配](../docs/CUSTOM_IMAGE_256X448.md)。客户端继续上传原始 `240×424` 图像，服务端按训练配置补边。
 
 上例在 GPU 本机测试。若机器人在另外一台可信内网机器，服务器需通过受保护的端口/SSH 隧道可达；直接监听 `0.0.0.0` 时必须在防火墙限制客户端源地址，不能无认证暴露公网。**没有 Token 或 Authorization 要求**。
 

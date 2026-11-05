@@ -9,7 +9,7 @@ from ..utils.normalizer import LinearNormalizer, NormMode
 from agenticwam.utils.pytorch_utils import dict_apply
 from agenticwam.utils.logging_config import get_logger
 from .base_processor import BaseProcessor
-from ..transforms.image import configure_image_resize
+from ..transforms.image import LetterboxResize, configure_image_resize
 
 logger = get_logger(__name__)
 
@@ -47,6 +47,7 @@ class AgenticWAMProcessor(BaseProcessor):
         camera_padding: Literal["zeros", "repeat"] = "zeros",
         num_image_steps: Optional[int] = None,
         image_resize_mode: Literal["stretch", "letterbox"] = "stretch",
+        image_letterbox_scale_up: bool = True,
     ):
         assert camera_padding in ("zeros", "repeat"), camera_padding
         self.camera_padding = camera_padding
@@ -61,10 +62,22 @@ class AgenticWAMProcessor(BaseProcessor):
         self.use_zh_instruction = use_zh_instruction
 
         # image
+        if not isinstance(image_letterbox_scale_up, bool):
+            raise ValueError("image_letterbox_scale_up must be a boolean")
         self.image_resize_mode = image_resize_mode
-        self.train_transforms = configure_image_resize(train_transforms, image_resize_mode)
-        self.val_transforms = configure_image_resize(val_transforms, image_resize_mode)
-        logger.info("[image-preproc] mode=%s; train and val image transforms configured", image_resize_mode)
+        self.image_letterbox_scale_up = image_letterbox_scale_up
+        self.train_transforms = configure_image_resize(train_transforms, image_resize_mode, image_letterbox_scale_up)
+        self.val_transforms = configure_image_resize(val_transforms, image_resize_mode, image_letterbox_scale_up)
+        if image_resize_mode == "letterbox":
+            for meta in self.shape_meta["images"]:
+                for transforms in (self.train_transforms, self.val_transforms):
+                    current = transforms[meta["key"]] if isinstance(transforms, Mapping) else transforms
+                    sizes = [transform.size for transform in current if isinstance(transform, LetterboxResize)]
+                    if sizes[-1] != tuple(meta["shape"][-2:]):
+                        raise ValueError(f"Camera {meta['key']!r} Resize size disagrees with shape_meta.image shape")
+        logger.info("[image-preproc] mode=%s scale_up=%s image_shapes=%s",
+                    image_resize_mode, image_letterbox_scale_up,
+                    [(meta["key"], tuple(meta["shape"])) for meta in self.shape_meta["images"]])
 
         self._is_train = None
 

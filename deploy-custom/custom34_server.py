@@ -35,7 +35,7 @@ from typing import Any
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
-ROOT = Path(__file__).resolve().parents[1]  # file must be at <repo>/deploy/custom34_server.py
+ROOT = Path(__file__).resolve().parents[1]  # <repo>/deploy/ or <repo>/deploy-custom/
 # Support a file placed elsewhere only with explicit AGENTICWAM_ROOT.
 ROOT = Path(os.environ.get("AGENTICWAM_ROOT", str(ROOT))).resolve()
 sys.path.insert(0, str(ROOT / "src"))
@@ -146,7 +146,7 @@ class Custom34Runtime:
         from agenticwam.datasets.lerobot.transforms.custom_unified_eef import (
             CustomUnifiedEEFTransform,
         )
-        from agenticwam.datasets.lerobot.transforms.image import resolve_eval_image_preproc
+        from agenticwam.datasets.lerobot.transforms.image import resolve_eval_image_preproc, validate_video_image_size
 
         if args.device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA unavailable but requested {args.device}")
@@ -161,12 +161,18 @@ class Custom34Runtime:
 
         # Fail early if the deployment recipe differs from the custom robot's training recipe.
         sm = cfg.data.train.shape_meta
-        if [int(x) for x in cfg.data.train.video_size] != [224, 320]:
-            raise ValueError("deploy_policy.py fixes the video size to 224x320; training video_size differs")
+        video_size = validate_video_image_size(cfg.data.train.video_size, sm)
+        val_size = validate_video_image_size(cfg.data.val.video_size, cfg.data.val.shape_meta)
+        if video_size != val_size:
+            raise ValueError("train/val video_size must match for custom deployment")
+        for split in (cfg.data.train, cfg.data.val):
+            validate_video_image_size(video_size, split.processor.shape_meta)
         train_resize_mode = str(cfg.data.train.processor.get("image_resize_mode", "stretch"))
         val_resize_mode = str(cfg.data.val.processor.get("image_resize_mode", "stretch"))
         if train_resize_mode != val_resize_mode:
             raise ValueError("train/val processor.image_resize_mode must match for custom deployment")
+        if cfg.data.train.processor.get("image_letterbox_scale_up", True) != cfg.data.val.processor.get("image_letterbox_scale_up", True):
+            raise ValueError("train/val processor.image_letterbox_scale_up must match for custom deployment")
         resolve_eval_image_preproc(train_resize_mode, os.environ.get("AGENTICWAM_EVAL_PREPROC", ""))
         if expected_dim(sm.state[0].raw_shape) != 34 or expected_dim(sm.action[0].raw_shape) != 20:
             raise ValueError("training shape_meta must have raw state=34/action=20")
@@ -199,7 +205,7 @@ class Custom34Runtime:
             device=args.device, action_horizon=self.horizon, replan_steps=args.replan_steps,
             num_inference_steps=args.num_inference_steps, sigma_shift=None,
             seed=None, text_ckpt_dir=str(cfg.paths.text_encoder), text_max_len=128,
-            n_cameras=3, num_video_frames=n_v,
+            n_cameras=3, num_video_frames=n_v, video_size=video_size,
         )
         transforms = self.policy.processor.action_state_transforms
         custom = [t for t in transforms if isinstance(t, CustomUnifiedEEFTransform)]

@@ -80,6 +80,7 @@ data:
     processor:
       _target_: agenticwam.datasets.lerobot.processors.agenticwam_processor.AgenticWAMProcessor
       image_resize_mode: stretch  # letterbox: keep aspect ratio and centre-pad
+      image_letterbox_scale_up: true  # false: pad small images without enlarging
       shape_meta: ${data.train.shape_meta}
       num_obs_steps: ${data.train.num_frames}
       num_output_cameras: 3
@@ -174,6 +175,7 @@ data:
     processor:
       _target_: agenticwam.datasets.lerobot.processors.agenticwam_processor.AgenticWAMProcessor
       image_resize_mode: stretch  # letterbox: keep aspect ratio and centre-pad
+      image_letterbox_scale_up: true  # false: pad small images without enlarging
       shape_meta: ${data.train.shape_meta}
       num_obs_steps: ${data.train.num_frames}
       num_output_cameras: 3

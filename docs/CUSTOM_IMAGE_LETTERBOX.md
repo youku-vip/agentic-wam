@@ -1,5 +1,7 @@
 # Custom 图像等比例缩放与补边
 
+需要 `256×448` 时使用新版 [256×448 适配包与配置命令](CUSTOM_IMAGE_256X448.md)。本页保留 v1 的 `224×320` 说明；v2 同时支持两种尺寸。
+
 当前 custom 数据原图为 `[高=240, 宽=424]`。旧训练链路先通过 processor 的 `ToTensor → Resize([224,320])` 分别缩放宽高，再通过 RobotVideoDataset 的等比例 resize、中心裁剪和 `[-1,1]` 归一化。第一步的缩放比例分别为 `224/240≈0.9333`、`320/424≈0.7547`，物体相对变高约 23.7%；后续处理在相同尺寸下基本不改变像素，无法恢复原始比例。服务端默认 parity 路径也直接缩放到 `[224,320]`，与旧训练一致。
 
 本补丁增加 `processor.image_resize_mode=letterbox`。它将 processor 中显式指定 `[高,宽]` 的 torchvision Resize 替换为统一的 LetterboxResize，保留原来的插值方式与 antialias 参数。对当前数据，处理结果为：

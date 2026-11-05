@@ -26,7 +26,7 @@ class LetterboxResize(nn.Module):
     """
 
     def __init__(self, size, interpolation=TF.InterpolationMode.BILINEAR,
-                 antialias=True, fill=0.0):
+                 antialias=True, fill=0.0, scale_up=True):
         super().__init__()
         if isinstance(size, int) or len(size) != 2:
             raise ValueError("LetterboxResize requires size=[height, width]")
@@ -34,10 +34,13 @@ class LetterboxResize(nn.Module):
             raise ValueError("LetterboxResize size must contain two positive integers")
         if not math.isfinite(fill):
             raise ValueError("LetterboxResize fill must be finite")
+        if not isinstance(scale_up, bool):
+            raise ValueError("LetterboxResize scale_up must be a boolean")
         self.size = tuple(int(v) for v in size)
         self.interpolation = interpolation
         self.antialias = antialias
         self.fill = float(fill)
+        self.scale_up = scale_up
 
     def forward(self, image):
         if not isinstance(image, torch.Tensor) or image.ndim not in (3, 4):
@@ -47,6 +50,8 @@ class LetterboxResize(nn.Module):
             raise ValueError("LetterboxResize cannot resize an empty image")
         target_h, target_w = self.size
         scale = min(target_h / height, target_w / width)
+        if not self.scale_up:
+            scale = min(scale, 1.0)
         resized_h = max(1, min(target_h, int(height * scale + 0.5)))
         resized_w = max(1, min(target_w, int(width * scale + 0.5)))
         image = F.resize(image, [resized_h, resized_w],
@@ -57,14 +62,14 @@ class LetterboxResize(nn.Module):
                              target_h - resized_h - top], fill=self.fill)
 
 
-def configure_image_resize(transforms, mode):
+def configure_image_resize(transforms, mode, scale_up=True):
     """Replace explicit H/W Resize operations only when letterbox is selected."""
     if mode not in ("stretch", "letterbox"):
         raise ValueError(f"image_resize_mode must be stretch|letterbox, got {mode!r}")
     if mode == "stretch":
         return transforms
     if isinstance(transforms, Mapping):
-        return {key: configure_image_resize(value, mode) for key, value in transforms.items()}
+        return {key: configure_image_resize(value, mode, scale_up) for key, value in transforms.items()}
     if transforms is None:
         raise ValueError("letterbox requires explicit train/val image transforms")
     result, found = [], False
@@ -73,12 +78,33 @@ def configure_image_resize(transforms, mode):
             if transform.max_size is not None:
                 raise ValueError("letterbox requires Resize(size=[height, width], max_size=None)")
             transform = LetterboxResize(transform.size, interpolation=transform.interpolation,
-                                        antialias=transform.antialias)
+                                        antialias=transform.antialias, scale_up=scale_up)
+        elif isinstance(transform, LetterboxResize):
+            transform = LetterboxResize(transform.size, interpolation=transform.interpolation,
+                                        antialias=transform.antialias, fill=transform.fill, scale_up=scale_up)
         found = found or isinstance(transform, LetterboxResize)
         result.append(transform)
     if not found:
         raise ValueError("letterbox requires Resize(size=[height, width]) in each image transform list")
     return result
+
+
+def validate_video_image_size(size, shape_meta=None):
+    """Validate the common RGB size used by Qwen patch/merge and video patches."""
+    if isinstance(size, (int, str)) or len(size) != 2:
+        raise ValueError("video_size must be [height, width]")
+    if any(isinstance(v, bool) or int(v) != v or v <= 0 or int(v) % 32 for v in size):
+        raise ValueError("video_size height/width must be positive multiples of 32")
+    size = tuple(int(v) for v in size)
+    if shape_meta is not None:
+        images = shape_meta["images"]
+        if not images:
+            raise ValueError("shape_meta.images must contain at least one camera")
+        for image in images:
+            shape = tuple(image["shape"])
+            if shape != (3, *size):
+                raise ValueError(f"Camera {image['key']!r} shape={shape} disagrees with video_size={size}")
+    return size
 
 
 def resolve_eval_image_preproc(image_resize_mode, requested=""):

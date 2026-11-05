@@ -15,6 +15,7 @@ SOURCE_FILES = (
     "src/agenticwam/datasets/lerobot/processors/agenticwam_processor.py",
     "robotwin/deploy/deploy_policy.py",
     "deploy-custom/custom34_server.py",
+    "deploy/custom34_server.py",
     "scripts/configure_custom_image_preproc.py",
 )
 

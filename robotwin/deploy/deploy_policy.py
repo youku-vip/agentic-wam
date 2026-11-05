@@ -1,7 +1,7 @@
 """AGENTICWAM-Cosmos RoboTwin deploy policy (2-expert: video + action).
 
 Adapts AgenticWAM's deploy_policy for the Cosmos-2.5-2B backbone:
-  * observation  -> MULTIVIEW obs video [1,3,nc,224,320] in [-1,1] (views on the time axis,
+  * observation  -> MULTIVIEW obs video [1,3,nc,H,W] in [-1,1] (views on the time axis,
                     per-view VAE encode), matching configs/robotwin/data/robotwin_official.yaml.
   * instruction  -> standalone Cosmos-Reason1 (Qwen2.5-VL) prompt_embs [1,L,100352].
   * AgenticWAMCosmos.infer_action(obs, proprio, prompt_embs) -> 64-D unified delta-EEF action chunk.
@@ -56,7 +56,8 @@ from agenticwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT  # no
 from agenticwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json  # noqa: E402
 from agenticwam.datasets.dataset_utils import (  # noqa: E402
     ResizeSmallestSideAspectPreserving, CenterCrop, Normalize)
-from agenticwam.datasets.lerobot.transforms.image import resolve_eval_image_preproc  # noqa: E402
+from agenticwam.datasets.lerobot.transforms.image import (  # noqa: E402
+    resolve_eval_image_preproc, validate_video_image_size)
 from torchvision.transforms.functional import (  # noqa: E402
     resize as _tv_resize, center_crop as _tv_center_crop)
 
@@ -269,7 +270,7 @@ class AgenticWAMCosmosRobotWinPolicy:
     def __init__(self, model_cfg, processor_cfg, checkpoint_path, dataset_stats_path,
                  device, action_horizon, replan_steps, num_inference_steps, sigma_shift,
                  seed, text_ckpt_dir, text_max_len, n_cameras, num_video_frames,
-                 video_log_dir=None):
+                 video_log_dir=None, video_size=None):
         # The checkpoint supplies every trained weight (dit.*, proprio_encoder.*, code_vision.*); the frozen
         # VAE comes from wan_vae_path. No Cosmos video checkpoint is read at inference.
         mc = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
@@ -286,37 +287,28 @@ class AgenticWAMCosmosRobotWinPolicy:
         self.n_cameras = int(n_cameras)
 
         self.processor: AgenticWAMProcessor = instantiate(processor_cfg).eval()
+        if video_size is None:
+            video_size = self.processor.shape_meta["images"][0]["shape"][-2:]
+        self.video_size = validate_video_image_size(video_size, self.processor.shape_meta)
         self.processor.set_normalizer_from_stats(load_dataset_stats_from_json(str(dataset_stats_path)))
 
         self.text = _CosmosTextEncoder(text_ckpt_dir, device, max_len=text_max_len)
 
-        # EXACT training obs transforms (video_size=[224,320]) -> pixel-parity with the data pipeline.
-        self._resize = ResizeSmallestSideAspectPreserving(args={"img_w": 320, "img_h": 224})
-        self._crop = CenterCrop(args={"img_w": 320, "img_h": 224})
+        # Use the training video geometry for both final resize and crop.
+        image_h, image_w = self.video_size
+        self._resize = ResizeSmallestSideAspectPreserving(args={"img_w": image_w, "img_h": image_h})
+        self._crop = CenterCrop(args={"img_w": image_w, "img_h": image_h})
         self._norm = Normalize(args={"mean": 0.5, "std": 0.5})
-        # EVAL PREPROCESSING: mirror the training full-frame transform before resizing.
-        # The three transforms above replicate only STAGE 2 of the training pipeline
-        # (robot_video_dataset.py: video_size=[224,320] resize -> centre crop -> [-1,1] norm).
-        # STAGE 1 -- the processor's train_transforms on the FULL frame -- was never applied at eval.
-        # On the sim's native 240x320 D435 frame stage 2's resize is a no-op (scale =
-        # max(320/320, 224/240) = 1.0) and the centre crop then drops 8 rows top and bottom, so eval
-        # saw objects ~7% taller than training and lost content training always kept.
-        #
-        # AGENTICWAM_EVAL_PREPROC selects stage 1.  DEFAULT = "parity" (the fix is ON as of 2026-09-17).
-        #   parity      : resize the full frame to [224,320]. Correct for every model whose
-        #                 train_transforms are ToTensor+Resize (all shipped RoboTwin configs).
-        #   parity_crop : centre-crop AGENTICWAM_EVAL_PREPROC_CROP (default 0.95) of the INPUT, then resize.
-        #                 Correct for a model trained with RandomCrop(0.95)+Resize (the
-        #                 train-RandomCrop / eval-CenterCrop pairing). The crop MUST be computed
-        #                 from the actual input size -- a hardcoded 456x608 silently ZERO-PADS a
-        #                 240x320 sim frame instead of erroring.
-        #   legacy      : the pre-2026-09-17 behaviour, for reproducing published numbers exactly.
-        # letterbox uses the processor's exact val transforms, shared with training.
+        # STAGE 1 mirrors the processor at the configured target size.
+        # parity/parity_crop retain the historical stretch/crop recipes.
+        # letterbox calls the exact configured val transforms, shared with training.
+        # auto selects the recipe from processor.image_resize_mode.
         _mode = resolve_eval_image_preproc(
             self.processor.image_resize_mode, os.environ.get("AGENTICWAM_EVAL_PREPROC", ""))
         self._preproc_mode = _mode
         self._preproc_crop = float(os.environ.get("AGENTICWAM_EVAL_PREPROC_CROP", "0.95"))
-        logger.info("[preproc] mode=%s%s", self._preproc_mode,
+        logger.info("[preproc] mode=%s video_size=%s scale_up=%s%s", self._preproc_mode,
+                    list(self.video_size), self.processor.image_letterbox_scale_up,
                     f" crop={self._preproc_crop}" if self._preproc_mode == "parity_crop" else "")
 
         self.action_horizon = int(action_horizon)
@@ -382,7 +374,7 @@ class AgenticWAMCosmosRobotWinPolicy:
         normalizer = self.processor.normalizer.normalizers["action"][key]
         return normalizer.backward(action.to(dtype=torch.float32, device="cpu")).numpy()
 
-    # ── multiview obs [1,3,nc,224,320] in [-1,1] ──────────────────────────────
+    # ── multiview obs [1,3,nc,H,W] in [-1,1] ──────────────────────────────
     def _build_obs_video(self, observation: Dict[str, Any]) -> torch.Tensor:
         obs = observation["observation"]
         views = []
@@ -402,13 +394,13 @@ class AgenticWAMCosmosRobotWinPolicy:
                 _h, _w = video.shape[-2], video.shape[-1]
                 video = _tv_center_crop(video, [int(round(self._preproc_crop * _h)),
                                                 int(round(self._preproc_crop * _w))])
-            video = _tv_resize(video, [224, 320], antialias=True)            # [nc,3,224,320]
-        # STAGE 2 = robot_video_dataset video_size=[224,320]. Once stage 1 has run the resize/crop
-        # are no-ops (224x320 in) and only the normalisation bites -- exactly as in training.
+            video = _tv_resize(video, list(self.video_size), antialias=True)  # [nc,3,H,W]
+        # STAGE 2 mirrors RobotVideoDataset at the configured video_size.
+        # At the target size resize/crop are no-ops; normalization is shared with training.
         video = self._resize(video)
         video = self._crop(video)
-        video = self._norm(video)                                           # [nc,3,224,320] in [-1,1]
-        video = video.permute(1, 0, 2, 3).unsqueeze(0)                      # [1,3,nc,224,320]
+        video = self._norm(video)                                           # [nc,3,H,W] in [-1,1]
+        video = video.permute(1, 0, 2, 3).unsqueeze(0)                      # [1,3,nc,H,W]
         return video.to(device=self.device, dtype=torch.float32)
 
     _SKILL_MAP = None
@@ -809,6 +801,7 @@ def get_model(usr_args: Dict[str, Any]):
         text_max_len=text_max_len,
         n_cameras=n_cameras,
         num_video_frames=num_video_frames,
+        video_size=_dtrain.get("video_size", None),
         video_log_dir=(None if _is_none_like(usr_args.get("eval_output_dir"))
                        else str(usr_args.get("eval_output_dir"))),
     )
