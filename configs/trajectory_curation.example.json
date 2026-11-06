@@ -1,5 +1,5 @@
 {
-  "description": "Local review examples for custom34/action20 at nominal 10 Hz. NOT paper-author settings, certified robot limits, or thresholds validated on all tasks.",
+  "description": "Translation-only teleoperation starting profile. Residual plus dynamics confirmation and edge-only idle trimming; NOT author settings, robot limits or full-dataset calibrated thresholds.",
   "smoothing": {
     "window_frames": 7,
     "polynomial_degree": 2
@@ -7,15 +7,17 @@
   "thresholds": {
     "position_residual": 0.025,
     "position_step": 0.08,
-    "rotation_step": 25.0,
     "acceleration": 8.0,
     "jerk": 150.0
   },
+  "anomaly_rule": "residual_and_dynamics",
   "min_segment_frames": 33,
   "idle": {
-    "enabled": false,
+    "enabled": true,
+    "mode": "trim_edges",
     "window_frames": 32,
-    "position_range_m": 0.005,
-    "min_active_fraction": 0.7
+    "position_range_m": 0.002,
+    "min_active_fraction": 0.7,
+    "skip_task_indices": [2]
   }
 }

@@ -22,8 +22,10 @@ sys.path.insert(0, str(REPO / "src"))
 
 def config(**thresholds):
     value = json.loads(curation.DEFAULT_CONFIG.read_text())
+    value["idle"]["enabled"] = False
     if thresholds:
         value["thresholds"] = {key: thresholds.get(key) for key in curation.METRICS}
+        value["anomaly_rule"] = "any"
     return value
 
 
@@ -130,12 +132,13 @@ class NumericCurationTests(unittest.TestCase):
         for segment in result["retained_segments"]:
             self.assertFalse(set(range(segment["start_frame"], segment["end_frame"])) & support)
 
-    def test_so3_wrap_uses_two_degrees(self):
-        original = frame(n=40, yaw=[179, -179, *([-177]*38)])
-        result, _, _ = curation.analyze(5, original, config(rotation_step=25))
+    def test_large_orientation_changes_do_not_change_translation_selection(self):
+        original = frame(n=40, yaw=[179, -90] * 20)
+        result, events, _ = curation.analyze(5, original, config())
         self.assertEqual(result["bad_frames"], [])
+        self.assertEqual(events, [])
 
-    def test_exact_repeats_are_reported_without_automatic_deletion(self):
+    def test_exact_repeats_do_not_trigger_automatic_deletion(self):
         original = frame()
         state = np.stack(original["observation.state"])
         state[:, 14] = 0
@@ -143,18 +146,18 @@ class NumericCurationTests(unittest.TestCase):
         original["observation.state"] = list(state)
         original["action"] = list(np.r_[state[1:, 14:34], state[-1:, 14:34]])
         result, _, _ = curation.analyze(5, original, config())
-        self.assertTrue(result["repeated_full_state_groups"])
         self.assertEqual(result["bad_frames"], [])
         self.assertEqual(len(result["retained_segments"]), 1)
 
-    def test_invalid_time_and_degenerate_rotation_create_cuts(self):
+    def test_invalid_time_is_cut_but_rotation_is_not_a_selection_criterion(self):
         original = frame()
         original.loc[40, "timestamp"] = original.loc[39, "timestamp"]
         rotation = original["observation.state"].iloc[50].copy()
         rotation[17:23] = 0
         original.at[50, "observation.state"] = rotation
         result, _, _ = curation.analyze(5, original, config())
-        self.assertTrue({39, 40, 50} <= set(result["bad_frames"]))
+        self.assertTrue({39, 40} <= set(result["bad_frames"]))
+        self.assertNotIn(50, result["bad_frames"])
 
     def test_idle_is_optional_and_can_reject_pure_rotation(self):
         original = frame(yaw=np.linspace(0, 90, 80))
@@ -166,9 +169,64 @@ class NumericCurationTests(unittest.TestCase):
         self.assertEqual(len(disabled["retained_segments"]), 1)
         enabled_config = config()
         enabled_config["idle"]["enabled"] = True
+        enabled_config["idle"]["skip_task_indices"] = []
         enabled = curation.analyze(5, original, enabled_config)[0]
         self.assertEqual(enabled["retained_segments"], [])
         self.assertEqual(enabled["dropped_segments"][0]["reason"], "idle_all_windows")
+
+    def test_default_idle_policy_preserves_configured_knob_task(self):
+        original = frame(yaw=np.linspace(0, 90, 80))
+        state = np.stack(original["observation.state"])
+        state[:, 14] = 0
+        original["observation.state"] = list(state)
+        original["action"] = list(np.r_[state[1:, 14:34], state[-1:, 14:34]])
+        settings = json.loads(curation.DEFAULT_CONFIG.read_text())
+        result, _, _ = curation.analyze(5, original, settings)
+        self.assertEqual(result["retained_segments"][0]["frames"], 80)
+        original["task_index"] = 0
+        result, _, _ = curation.analyze(5, original, settings)
+        self.assertEqual(result["retained_segments"], [])
+
+    def test_edge_only_idle_keeps_interior_pauses_below_70_percent_activity(self):
+        state = np.zeros((300, 34))
+        state[50:71, 14] = np.arange(21) * .001
+        state[71:220, 14] = .02
+        state[220:241, 14] = .02 + np.arange(21) * .001
+        state[241:, 14] = .04
+        settings = config()["idle"]
+        settings["enabled"] = True
+        start, stop, fraction, why = curation.trim_idle(state, 0, 300, settings)
+        self.assertIsNone(why)
+        self.assertGreater(start, 0)
+        self.assertLess(stop, 300)
+        self.assertLess(start, 100)
+        self.assertGreater(stop, 200)
+        self.assertLess(fraction, .7)
+        settings["mode"] = "paper"
+        self.assertEqual(curation.trim_idle(state, 0, 300, settings)[3], "idle_active_fraction")
+
+    def test_a_single_dynamic_peak_without_residual_is_only_a_review_event(self):
+        original = frame()
+        state = np.stack(original["observation.state"])
+        state[:, 14] = np.minimum(np.arange(80), 30) * .005
+        original["observation.state"] = list(state)
+        original["action"] = list(np.r_[state[1:, 14:34], state[-1:, 14:34]])
+        settings = config()
+        settings["thresholds"]["jerk"] = 1.
+        result, events, _ = curation.analyze(5, original, settings)
+        self.assertEqual(result["bad_frames"], [])
+        self.assertTrue(any(event["metric"] == "jerk" for event in events))
+        self.assertTrue(all(not event["used_for_exclusion"] for event in events))
+
+    def test_default_candidates_require_both_residual_and_dynamic_support(self):
+        original = frame(spike=40)
+        result, events, _ = curation.analyze(5, original, config())
+        residual = {event["support_start"] for event in events if event["metric"] == "position_residual"}
+        dynamics = {index for event in events if event["metric"] != "position_residual"
+                    for index in range(event["support_start"], event["support_end_exclusive"])}
+        self.assertEqual(set(result["bad_frames"]), residual & dynamics)
+        self.assertIn(40, result["bad_frames"])
+        self.assertEqual({event["source"] for event in events}, {"state"})
 
     def test_idle_uses_either_arm_and_trims_only_continuous_ends(self):
         state = np.zeros((100, 34))
@@ -202,11 +260,14 @@ class NumericCurationTests(unittest.TestCase):
         state[43:, 32] = 1
         original["observation.state"] = list(state)
         original["action"] = list(np.r_[state[1:, 14:34], state[-1:, 14:34]])
-        record, _, _ = curation.analyze(5, original, config())
+        record, _, _ = curation.analyze(5, original, config(jerk=150))
         coverage = record["gripper_transition_coverage"]["left"]
         self.assertEqual(coverage["original_transitions"], 2)
         self.assertEqual(coverage["retained_transitions"], 1)
         self.assertEqual(coverage["missing_transition_frames"], [43])
+        gentle, _, _ = curation.analyze(5, original, config())
+        self.assertLess(len(gentle["bad_frames"]), len(record["bad_frames"]))
+        self.assertEqual(gentle["gripper_transition_coverage"]["left"]["missing_transition_frames"], [43])
 
     def test_invalid_config_and_mixed_tasks_fail(self):
         invalid = config()

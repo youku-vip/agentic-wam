@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Paper-informed stability filtering for custom34/action20; original values stay intact.
+"""Translation-only, paper-informed filtering for custom34/action20 teleoperation.
 
 Open-HumanScale, arXiv:2611.06817v1, section 2.2 (pp. 6-7), motivates
 residual/dynamics checks followed by continuous-segment selection. The smoother,
-thresholds, support-frame exclusion and robot boundary rules here are adaptations,
+thresholds, candidate localization, idle and robot boundary rules here are adaptations,
 not parameters disclosed in the paper. No model or robot is run.
 """
 from __future__ import annotations
@@ -21,12 +21,11 @@ import tempfile
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from audit_custom_trajectories import eef_metrics, read_episodes, time_edges
+from audit_custom_trajectories import differences, read_episodes, time_edges
 
-VERSION = "custom-paper-curation-v1"
+VERSION = "custom-paper-curation-v2-translation"
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs/trajectory_curation.example.json"
-METRICS = {"position_residual": (0, "m"), "position_step": (1, "m"),
-           "rotation_step": (1, "deg"), "acceleration": (2, "m/s^2"),
+METRICS = {"position_residual": (0, "m"), "position_step": (1, "m"), "acceleration": (2, "m/s^2"),
            "jerk": (3, "m/s^3")}
 
 
@@ -39,8 +38,8 @@ def sha_file(path):
 
 
 def validate_config(config):
-    if set(config) != {"description", "smoothing", "thresholds", "min_segment_frames", "idle"}:
-        raise ValueError("Config must contain description, smoothing, thresholds, min_segment_frames and idle")
+    if set(config) != {"description", "smoothing", "thresholds", "anomaly_rule", "min_segment_frames", "idle"}:
+        raise ValueError("Use a v2 translation config: description, smoothing, thresholds, anomaly_rule, min_segment_frames, idle")
     smoothing = config["smoothing"]
     if set(smoothing) != {"window_frames", "polynomial_degree"}:
         raise ValueError("Invalid smoothing config")
@@ -56,16 +55,25 @@ def validate_config(config):
             raise ValueError(f"{key}: threshold must be finite positive or null")
     if not any(v is not None for v in thresholds.values()):
         raise ValueError("Enable at least one stability threshold")
+    if config["anomaly_rule"] not in {"residual_and_dynamics", "any"}:
+        raise ValueError("anomaly_rule must be residual_and_dynamics or any")
+    if config["anomaly_rule"] == "residual_and_dynamics" and (
+            thresholds["position_residual"] is None or not any(
+                thresholds[key] is not None for key in ("position_step", "acceleration", "jerk"))):
+        raise ValueError("residual_and_dynamics requires a residual threshold and at least one dynamic threshold")
     if type(config["min_segment_frames"]) is not int or config["min_segment_frames"] < 2:
         raise ValueError("min_segment_frames must be an integer >=2")
     idle = config["idle"]
-    if set(idle) != {"enabled", "window_frames", "position_range_m", "min_active_fraction"}:
+    if set(idle) != {"enabled", "mode", "window_frames", "position_range_m", "min_active_fraction", "skip_task_indices"}:
         raise ValueError("Invalid idle config")
     if (type(idle["enabled"]) is not bool or type(idle["window_frames"]) is not int or idle["window_frames"] < 2
             or type(idle["position_range_m"]) not in (int, float) or not np.isfinite(idle["position_range_m"])
             or idle["position_range_m"] <= 0 or type(idle["min_active_fraction"]) not in (int, float)
             or not np.isfinite(idle["min_active_fraction"]) or not 0 < idle["min_active_fraction"] <= 1):
         raise ValueError("Invalid idle window, motion threshold or active fraction")
+    if (idle["mode"] not in {"trim_edges", "paper"} or not isinstance(idle["skip_task_indices"], list)
+            or any(type(task) is not int or task < 0 for task in idle["skip_task_indices"])):
+        raise ValueError("Idle mode must be trim_edges/paper with nonnegative integer skip_task_indices")
     return config
 
 
@@ -132,16 +140,8 @@ def smooth_positions(positions, times, edges, window=7, degree=2):
     return result
 
 
-def repeated_states(state):
-    groups = defaultdict(list)
-    for index, row in enumerate(state):
-        if np.isfinite(row).all():
-            groups[row.tobytes()].append(index)
-    return [indices for indices in groups.values() if len(indices) > 1 and np.any(np.diff(indices) > 1)]
-
-
-def trim_idle(state, start, stop, config):
-    if not config["enabled"]:
+def trim_idle(state, start, stop, config, task_index=None):
+    if not config["enabled"] or task_index in config["skip_task_indices"]:
         return start, stop, None, None
     width = config["window_frames"]
     if stop - start < width:
@@ -157,7 +157,8 @@ def trim_idle(state, start, stop, config):
     fraction = float(active[indices[0]:indices[-1] + 1].mean())
     end = start + int(indices[-1]) + width
     start += int(indices[0])
-    return start, end, fraction, "idle_active_fraction" if fraction < config["min_active_fraction"] else None
+    why = "idle_active_fraction" if config["mode"] == "paper" and fraction < config["min_active_fraction"] else None
+    return start, end, fraction, why
 
 
 def analyze(episode, frame, config):
@@ -174,31 +175,44 @@ def analyze(episode, frame, config):
             reasons[index].add("invalid_time_edge")
     events = []
     smoothing = config["smoothing"]
-    for source, values, offsets in (("state", state, (14, 23)), ("action", action, (0, 9))):
-        for side, off in zip(("left", "right"), offsets):
-            pose = values[:, off:off + 9]
-            scores, quality = eef_metrics(pose, times, edges)
-            fitted = smooth_positions(pose[:, :3], times, edges, smoothing["window_frames"], smoothing["polynomial_degree"])
-            scores["position_residual"] = np.linalg.norm(pose[:, :3] - fitted, axis=1)
-            for index in quality["invalid_rotation6d_frames"]:
+    # Actions are verified as next-state targets below; they are not independent
+    # measured trajectories and must not shift a detection one frame earlier.
+    for side, off in (("left", 14), ("right", 23)):
+        xyz = state[:, off:off + 3]
+        step, _, acceleration, jerk = differences(xyz, times, edges)
+        fitted = smooth_positions(xyz, times, edges, smoothing["window_frames"], smoothing["polynomial_degree"])
+        scores = dict(position_residual=np.linalg.norm(xyz - fitted, axis=1),
+            position_step=np.linalg.norm(step, axis=1), acceleration=np.linalg.norm(acceleration, axis=1),
+            jerk=np.linalg.norm(jerk, axis=1))
+        residual_bad = np.zeros(n, dtype=bool)
+        dynamic_support = np.zeros(n, dtype=bool)
+        current = []
+        for metric, (support, unit) in METRICS.items():
+            threshold = config["thresholds"][metric]
+            if threshold is None:
+                continue
+            exceeded = np.isfinite(scores[metric]) & (scores[metric] > threshold)
+            if metric == "position_residual":
+                residual_bad = exceeded
+            for end in np.flatnonzero(exceeded):
+                start = max(0, int(end) - support)
+                if metric != "position_residual":
+                    dynamic_support[start:end + 1] = True
+                current.append(dict(episode=episode, task_index=int(tasks[0]), source="state", side=side,
+                    metric=metric, value=float(scores[metric][end]), threshold=threshold, unit=unit,
+                    support_start=start, support_end_exclusive=int(end) + 1))
+        confirmed = residual_bad & dynamic_support
+        for event in current:
+            start, stop = event["support_start"], event["support_end_exclusive"]
+            selected = np.arange(start, stop) if config["anomaly_rule"] == "any" else np.flatnonzero(confirmed[start:stop]) + start
+            event["used_for_exclusion"] = bool(len(selected))
+            for index in selected:
                 bad[index] = True
-                reasons[index].add(f"{source}.{side}.invalid_rotation6d")
-            for metric, (support, unit) in METRICS.items():
-                threshold = config["thresholds"][metric]
-                if threshold is None:
-                    continue
-                for end in np.flatnonzero(np.isfinite(scores[metric]) & (scores[metric] > threshold)):
-                    start = max(0, int(end) - support)
-                    bad[start:end + 1] = True
-                    reason = f"{source}.{side}.{metric}"
-                    for index in range(start, end + 1):
-                        reasons[index].add(reason)
-                    events.append(dict(episode=episode, task_index=int(tasks[0]), source=source, side=side,
-                        metric=metric, value=float(scores[metric][end]), threshold=threshold, unit=unit,
-                        support_start=start, support_end_exclusive=int(end) + 1))
+                reasons[index].add(f"state.{side}.{event['metric']}")
+            events.append(event)
     kept, dropped = [], []
     for start, stop in runs(~bad):
-        begin, end, active_fraction, why = trim_idle(state, start, stop, config["idle"])
+        begin, end, active_fraction, why = trim_idle(state, start, stop, config["idle"], int(tasks[0]))
         if why is None and end - begin < config["min_segment_frames"]:
             why = "short_segment"
         item = dict(source_episode=episode, task_index=int(tasks[0]), start_frame=begin, end_frame=end,
@@ -218,7 +232,7 @@ def analyze(episode, frame, config):
             retained_transitions=len(transitions) - len(missing), missing_transition_frames=missing)
     return dict(episode=episode, frames=n, task_index=int(tasks[0]), source_sha256=frame_hash(frame),
         next_state_action_exact=bool(np.array_equal(action, target)),
-        bad_frames=np.flatnonzero(bad).tolist(), repeated_full_state_groups=repeated_states(state),
+        bad_frames=np.flatnonzero(bad).tolist(),
         retained_segments=kept, dropped_segments=dropped, timing=timing,
         gripper_transition_coverage=gripper_coverage), events, reasons
 
@@ -296,8 +310,8 @@ def preview_raw(document, frames_by_episode):
 
 def make_plan(args):
     config = validate_config(json.loads(args.config.read_text(encoding="utf-8")))
-    if args.idle_filter:
-        config["idle"]["enabled"] = True
+    if args.idle_override is not None:
+        config["idle"]["enabled"] = args.idle_override
     reader, raw_document = None, None
     if args.root:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -335,11 +349,12 @@ def make_plan(args):
     document = dict(version=VERSION, paper="arXiv:2611.06817v1 section 2.2, pages 6-7", source=source,
         script_sha256=sha_file(Path(__file__)), config=config, episodes=records, segments=segments,
         notes=["Smoother/thresholds are local adaptations; the paper does not disclose their numeric values.",
-               "All supporting frames of a threshold violation are excluded; original poses are never replaced by the fit.",
-               "Exact repeated states are reported only, not an unconditional deletion criterion.",
-               "Both state/action and both arms are checked; binary gripper changes are not differentiated.",
-               "Camera-pose/hand-visibility checks are unavailable without calibrated camera and visibility data.",
-               "32-frame/70% position-only idle filtering is optional; it may reject legitimate robot holds or pure rotation.",
+               "Only measured XYZ on both arms contributes to movement stability decisions; orientations are passed through.",
+               "Default: a residual frame needs a dynamic violation in overlapping support; lone dynamic peaks remain review events.",
+               "anomaly_rule=any instead excludes the full supporting frames of any enabled threshold violation.",
+               "No fitted pose is exported. Action is used for next-state alignment verification, not a second measured track.",
+               "Idle trim_edges preserves interior pauses; paper additionally applies the active-window fraction.",
+               "Position-only idle filtering skips explicitly configured task indices (default task 2, knob rotation).",
                "Timestamp is treated as physical time; nominal encoded timestamps cannot verify capture timing.",
                "New terminal actions use the final retained state as a hold, only after exact next-state alignment verification.",
                "Filtering can remove legitimate contacts or incomplete task stages; retained segments require review.",
@@ -356,7 +371,9 @@ def make_plan(args):
         stability_rejected_frames=len(flags), retained_segments=len(segments), retained_frames=sum(s["frames"] for s in segments),
         other_dropped_frames=sum(r["frames"] - len(r["bad_frames"]) - sum(s["frames"] for s in r["retained_segments"]) for r in records),
         idle_filter=config["idle"]["enabled"], by_task=dict(sorted(per_task.items())),
+        processing_scope="translation_only", anomaly_rule=config["anomaly_rule"], idle_policy=config["idle"],
         events_by_metric=dict(Counter(event["metric"] for event in events)),
+        review_only_events=sum(not event["used_for_exclusion"] for event in events),
         next_state_aligned_episodes=sum(r["next_state_action_exact"] for r in records),
         episodes_with_missing_gripper_transitions=[r["episode"] for r in records
             if any(item["missing_transition_frames"] for item in r["gripper_transition_coverage"].values())],
@@ -365,7 +382,7 @@ def make_plan(args):
     write_json(args.out / "segments.json", document)
     write_json(args.out / "summary.json", summary)
     for filename, rows, fields in (("frame_flags.csv", flags, ["episode", "task_index", "frame_index", "reasons"]),
-            ("events.csv", events, ["episode", "task_index", "source", "side", "metric", "value", "threshold", "unit", "support_start", "support_end_exclusive"])):
+            ("events.csv", events, ["episode", "task_index", "source", "side", "metric", "value", "threshold", "unit", "support_start", "support_end_exclusive", "used_for_exclusion"])):
         with (args.out / filename).open("w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
@@ -390,7 +407,7 @@ def export_dataset(args):
     from agenticwam.datasets.lerobot.v3.episode_reader import V3EpisodeReader
     document = json.loads(args.plan.read_text(encoding="utf-8"))
     if document.get("version") != VERSION or document["source"]["kind"] != "lerobot_v3":
-        raise ValueError("Export requires a v1 plan generated from this LeRobot v3 dataset, not raw JSON")
+        raise ValueError("Export requires a matching v2 translation plan from this LeRobot v3 dataset, not raw JSON or v1")
     records = validate_segments(document)
     if not document["segments"]:
         raise ValueError("Plan retains no segments; review thresholds before exporting")
@@ -520,7 +537,11 @@ def main():
     source.add_argument("--raw-json", type=Path)
     plan.add_argument("--episodes", type=int, nargs="+")
     plan.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    plan.add_argument("--idle-filter", action="store_true", help="Enable optional position-only 32-frame / 70%% idle filtering")
+    idle_flags = plan.add_mutually_exclusive_group()
+    idle_flags.add_argument("--idle-filter", dest="idle_override", action="store_const", const=True, default=None,
+                           help="Enable the configured position-only idle policy")
+    idle_flags.add_argument("--no-idle-filter", dest="idle_override", action="store_const", const=False,
+                           help="Disable idle filtering for this plan")
     export = commands.add_parser("export", help="Materialize reviewed segments as an independent v3 dataset")
     export.add_argument("--root", type=Path, required=True)
     export.add_argument("--plan", type=Path, required=True, help="segments.json from plan --root")

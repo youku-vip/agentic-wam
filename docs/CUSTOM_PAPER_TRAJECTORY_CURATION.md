@@ -1,144 +1,116 @@
-# 按 Open-HumanScale 的思路筛选 custom 动作轨迹
+# 遥操数据的平移稳定性筛选（v2）
 
-依据：[Open-HumanScale，arXiv:2611.06817v1](https://arxiv.org/pdf/2611.06817)，第 2.2 节，第 6–7 页。工具为 `scripts/curate_custom_trajectories.py`，版本 `custom-paper-curation-v1`。
+工具：`scripts/curate_custom_trajectories.py`；版本 `custom-paper-curation-v2-translation`。
 
-论文针对人类第一视角数据的估计手部轨迹，描述的是“检测异常、剔除、切成连续片段”。原始与平滑位置的差用于检测；论文没有说要把平滑后的整条轨迹当作新的动作标签。
+依据 [Open-HumanScale，arXiv:2611.06817v1](https://arxiv.org/pdf/2611.06817) 第 2.2 节、第 6–7 页，按高质量遥操数据的需求收窄为四项：平移稳定性、异常处理、静止筛选、平滑器与数值阈值。论文没有公开具体平滑器和阈值，本实现的参数是可修改的起点，不是论文原值或已经校准的硬件上限。
 
-同时核对了作者公开分支的 [datasets/config 源码（5ca7629）](https://github.com/DAGroup-PKU/HumanNet/tree/5ca7629a413218cb0e5b2f34e866c82cf28f8d11/humanwam_vanilla)，这些文件未提供可直接复用的轨迹清洗平滑器和数值阈值，因此本工具明确标为论文思路的适配实现。
+## 默认处理规则
 
-## 原文与本项目的适配范围
+| 项目 | v2 默认行为 |
+|---|---|
+| 平移稳定性 | 检查左右 observation.state 的 XYZ：平滑残差、相邻位移、加速度、jerk |
+| 异常处理 | 残差超阈值，且该帧落在另一项平移动态超阈值指标的支持范围内，才列为剔除候选；按候选帧切连续片段 |
+| 静止筛选 | 默认开启，只裁长时间静止的首尾，保留中间等待、接触及停顿；旋钮任务 2 默认跳过静止裁剪 |
+| 平滑器与阈值 | 7 帧局部二次拟合，使用实际 timestamp；拟合结果只用于检测，保留片段的原始 state 不平滑写回 |
 
-| 内容 | 论文描述 | 本工具 |
-|---|---|---|
-| 平移稳定性 | 原始/平滑位置残差、加速度、jerk、相邻位置变化 | 检查原始 state 和 action 的左右 EEF |
-| 姿态稳定性 | 相邻朝向变化 | rot6D 前两列还原 SO(3)，计算最短旋转角，不直接差分欧拉角 |
-| 异常处理 | 删除异常帧，再保留连续片段 | 保守剔除超阈值指标涉及的全部支持帧，片段之间不拼接 |
-| 静止筛选 | 32 帧滑窗，裁剪首尾静止段，活跃窗口占比至少 70% | 可选；机器人旋钮转动、接触与等待可能只有很小位移，因此默认关闭 |
-| 手部可见性/相机运动 | 可见手才参与监督；单独检查相机位姿 | 未实现：现有 custom34/action20 没有这些标定、可见性及动态相机数据 |
-| 平滑器与数值阈值 | 本文未列出具体算法、窗口与阈值 | 使用可配置的时间感知局部二次拟合，仅计算残差；所有阈值明确标为本地示例 |
+稳定性判定只使用 XYZ。旋转、关节和夹爪的变化不作为运动异常筛选条件，也不按完整状态重复自动删除记录。保留读取、有限值、时间顺序和导出索引等基础完整性检查。
 
-本工具保留现有 custom34/action20 和训练时的 64 维转换。论文第 2.3 节的 16 维表示、第 5.2 节的 49 维表示及相机坐标变换涉及另一套模型接口，未移植到当前检查点。没有相机外参时不能把机器人坐标直接改名为相机坐标。
+已上传样本中的动作是下一帧状态标签，因此只用记录的 state 做运动检测，避免把同一次回跳又提前一帧重复剔除；导出时再逐 episode 验证 action 的下一帧标签一致性。夹爪切换覆盖只写入复核报告，不参与筛选。
 
-非连续的完整 34 维重复状态另行报告，不因为数值重复就自动删除某次记录。重复可能出现在正常停顿或返回位置中，无法只凭相等关系认定哪一帧有误。
+## 参数
 
-## 获取与运行
+默认配置：`configs/trajectory_curation.example.json`。
 
-在已有本项目和 v3 loader 的环境中运行。依赖 NumPy、Pandas、PyArrow；不加载模型、训练 GPU 或 VLM。导出复用原始视频，分析阶段不解码视频。
+| 参数 | 默认值 | 作用 |
+|---|---:|---|
+| smoothing.window_frames | 7 | 局部窗口，奇数 |
+| smoothing.polynomial_degree | 2 | 拟合次数；支持非均匀 timestamp |
+| thresholds.position_residual | 0.025 m | 原始位置与拟合位置的距离 |
+| thresholds.position_step | 0.08 m | 相邻采样位移 |
+| thresholds.acceleration | 8 m/s² | 位置二阶差分的范数 |
+| thresholds.jerk | 150 m/s³ | 位置三阶差分的范数 |
+| anomaly_rule | residual_and_dynamics | 两类指标共同确认后筛选 |
+| min_segment_frames | 33 | 保留片段的最短长度，匹配当前观察窗口 |
+| idle.mode | trim_edges | 只裁首尾静止，保留中间停顿 |
+| idle.window_frames | 32 | 静止滑窗长度，10 Hz 时约 3 秒 |
+| idle.position_range_m | 0.002 m | 窗口内左右 XYZ 变化范围都不超过 2 mm 时记为静止 |
+| idle.skip_task_indices | [2] | 旋钮任务允许位移很小；此列表按本数据实际 task_index 设置 |
 
-可在仓库直接运行脚本，也可将 `deliveries/custom-paper-trajectory-curation-v1.zip` 解压到独立工具目录。以下按解压后的目录演示，保留服务器当前项目配置：
+`position_range_m` 越小，越容易把微小位移视为活动，静止裁剪越少。各轴极差合成为一个欧氏范数，左右臂取最大值。
+
+加速度涉及 3 帧，jerk 涉及 4 帧。默认联合判据只标记同时具有残差证据的帧，单独动态峰值保留为复核事件，不展开剔除整个支持范围。该策略用于减少正常启停的误删，不能保证已经精确定位所有坏帧，也可能漏过残差较小的异常。
+
+需要更严格的任一阈值触发规则，可设置 `anomaly_rule: "any"`；此模式剔除所有超阈值指标的完整支持范围。它仍只检查平移。单项阈值可以设为 `null`，但联合判据要求启用残差和至少一项动态阈值。
+
+静止默认不使用“活跃窗口占比小于 70% 则丢弃整段”的规则。如需该论文式规则，将 `idle.mode` 改为 `paper`，`idle.min_active_fraction` 为 0.7；task 2 的静止豁免仍以配置为准。其他数据集应根据真实任务编号调整 `skip_task_indices`。
+
+时间戳若仅为导出时生成的 frame_index/10，导数表示该时间假设下的结果，不证明真实采集加速度。阈值应结合正常遥操样本和全量分布调整，不能只用已挑出的异常样本调参。
+
+## 获取与使用
+
+工具只在 CPU 上运行，不加载模型或 VLM，分析不解码视频。依赖现有项目的 NumPy、Pandas、PyArrow 和 v3 reader。解压到单独目录，不覆盖现有训练配置：
 
 ```bash
 cd /data/algorithm/agentic-wam
 PY=/usr/local/bin/python3.11
 ROOT=/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30
-TOOL_DIR="$PWD/custom_paper_curation_v1"
+TOOL_DIR="$PWD/custom_paper_translation_v2"
 
 git fetch origin codex/custom-data-review-files
-git show FETCH_HEAD:deliveries/custom-paper-trajectory-curation-v1.zip \
-  > /tmp/custom-paper-trajectory-curation-v1.zip
-unzip -n /tmp/custom-paper-trajectory-curation-v1.zip -d "$TOOL_DIR"
+git show FETCH_HEAD:deliveries/custom-paper-trajectory-curation-v2-translation.zip \
+  > /tmp/custom-paper-trajectory-curation-v2-translation.zip
+unzip -n /tmp/custom-paper-trajectory-curation-v2-translation.zip -d "$TOOL_DIR"
 ```
 
-第一步只生成候选计划。输出目录必须是新目录，并位于原始数据根目录之外：
-
-```bash
-PLAN_DIR="$PWD/trajectory_curation_sample_v1"
-CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" \
-  "$TOOL_DIR/scripts/curate_custom_trajectories.py" plan \
-  --root "$ROOT" --episodes 655 2970 247 3075 \
-  --out "$PLAN_DIR"
-```
-
-这几个 episode 用于复核已发现的问题，不能代表四个任务的完整分布。四任务基础样本可以选 `0 1 2 3261`，任务仍以 `task_index` 为准。
-
-工具也支持已有的少量原始数值导出：
+先对四种任务样本生成只读筛选计划，输出目录必须是新目录且位于原始数据根目录之外：
 
 ```bash
 CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" \
   "$TOOL_DIR/scripts/curate_custom_trajectories.py" plan \
-  --raw-json ./trajectory_focus_raw_v2/raw_episodes.json \
-  --out ./trajectory_curation_raw_preview_v1
+  --root "$ROOT" --episodes 0 1 2 3261 \
+  --out ./trajectory_translation_sample_v2
 ```
 
-raw JSON 计划用于数值对比；缺少完整元数据和视频，不能直接导出完整 LeRobot 数据集。只有验证了下一帧动作约定，才额外生成 `curated_raw_episodes.json`。
+用 `--config /path/to/your_config.json` 指定调整后的参数。`--no-idle-filter` 可临时关闭静止裁剪；`--idle-filter` 临时开启配置中的静止策略。
 
-## 如何选参数
+`--raw-json /path/to/raw_episodes.json` 可替代 `--root`，用于已有数值样本的预览；没有完整元数据和视频，不能直接导出训练根目录。
 
-示例 `configs/trajectory_curation.example.json` 使用以下值。**这些不是论文原参数，也不是已经确认的机器人物理上限。正式筛选前应结合正常轨迹、接触阶段和视频调整。**
+## 输出和全量处理
 
-| 参数 | 示例 | 含义 |
-|---|---:|---|
-| `smoothing.window_frames` | 7 | 局部拟合窗口，奇数 |
-| `smoothing.polynomial_degree` | 2 | 局部多项式次数；使用实际 timestamp 的相对时间 |
-| `position_residual` | 0.025 m | 原始位置到局部拟合位置的距离 |
-| `position_step` | 0.08 m | 相邻帧位移 |
-| `rotation_step` | 25° | 相邻帧最短旋转角 |
-| `acceleration` | 8 m/s² | 原始位置的二阶差分范数 |
-| `jerk` | 150 m/s³ | 原始位置的三阶差分范数 |
-| `min_segment_frames` | 33 | 切段后保留的最短长度，配合当前 33 帧观察窗口 |
+- summary.json：分任务保留情况、候选帧数、其他丢弃帧数、实际参数。
+- events.csv：所有超阈值事件；used_for_exclusion=false 表示只复核，未用于剔除。
+- frame_flags.csv：实际剔除候选帧及原因，帧数已去重。
+- segments.json：保留的 [start_frame,end_frame)、源数据哈希和参数。
+- curated_raw_episodes.json：raw JSON 输入时的数值预览，末帧规则见下文。
 
-单项阈值可设为 `null` 禁用；至少启用一项。复制示例后用 `--config /path/to/your_thresholds.json` 指定，生成的计划会保存实际参数。
+`stability_rejected_frames` 是稳定性候选帧数，`other_dropped_frames` 包括静止裁剪与过短片段。被裁成不足 33 帧的有效片段也会丢弃，因此保留比例不能仅从候选帧数推断。报告中的夹爪切换缺失提示用于复核切段是否破坏关键阶段，不证明物理成功或失败。
 
-超阈值条件按 OR 合并。位移和转角涉及 2 帧，加速度涉及 3 帧，jerk 涉及 4 帧；本工具剔除整个支持范围，不能将结果理解成对单个坏帧的精确定位。残差可能使邻近正常帧也被标记，适合保守筛选。
-
-差分不跨 episode、坏时间间隔或大间隙；局部拟合也不跨坏时间/无效位置。时间异常规则沿用现有审计脚本：`dt<=1e-4 s` 或超过中位正间隔 5 倍。时间戳若只是导出时生成的 `frame_index/10`，计算得到的是该时间假设下的指标，不能据此确认真实采集加速度。
-
-需要尝试论文的静止筛选时，增加 `--idle-filter`。本实现将 32 帧内的 XYZ 各维极差合成为位置变化量，左右臂取最大值，阈值示例为 5 mm；这是对论文未明确给出的“位置变化”定义的适配。先裁剪首尾无活跃窗口部分，再检查剩余窗口的活跃占比。32 帧在 10 Hz 下约 3.2 秒，不能直接当作论文数据的相同时长。纯旋转、等待、保持接触或夹爪操作可能被位置规则误删，应先检查任务 2 的保留比例。
-
-## 查看计划
-
-| 文件 | 用途 |
-|---|---|
-| `summary.json` | 分任务保留比例、稳定性剔除帧数、其他裁剪帧数、片段数 |
-| `events.csv` | 每个超阈值指标及其完整支持帧范围；一个位置可对应多项事件 |
-| `frame_flags.csv` | 去重后的稳定性候选帧及全部原因 |
-| `segments.json` | 原始 episode 的半开区间 `[start_frame,end_frame)`、数据哈希、参数及丢弃原因 |
-
-`stability_rejected_frames` 是去重后的候选帧数，`other_dropped_frames` 还包括切分后过短的片段及可选静止裁剪。两者相加才是总减少量。不能将这些统计当作失败演示数量。
-
-`episodes_with_missing_gripper_transitions` 列出切分后丢失夹爪切换的源 episode；逐段详情见 `gripper_transition_coverage`。只有同一保留片段同时包含切换前后两帧，才记作保留切换。用于机器人后训练时，应重点复核这些片段是否缺少释放或抓取阶段，必要时调整阈值或排除整个 episode，不自动补造夹爪动作。这个指标检查的是记录覆盖范围，不证明物理接触或任务成功。
-
-复核应包括：每个任务是否仍有足够数据；抓取、接触、释放是否被保留；动作是否与视频对应；任务是否在切分后缺少关键阶段。少量异常样本的结果不能作为全量阈值调优的唯一依据。
-
-## 全量计划与导出
-
-阈值复核后，去掉 `--episodes`，为全数据生成新计划：
+复核样本后，去掉 `--episodes` 生成全量计划：
 
 ```bash
-PLAN_DIR="$PWD/trajectory_curation_all_v1"
+PLAN_DIR="$PWD/trajectory_translation_all_v2"
 CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" \
   "$TOOL_DIR/scripts/curate_custom_trajectories.py" plan \
   --root "$ROOT" --out "$PLAN_DIR"
 ```
 
-按计划导出新根目录，不修改原始目录：
+确认每个任务和关键阶段的保留情况后，在新根目录导出：
 
 ```bash
-CLEAN_ROOT="${ROOT}_curated_v1"
+CLEAN_ROOT="${ROOT}_translation_v2"
 CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" \
   "$TOOL_DIR/scripts/curate_custom_trajectories.py" export \
   --root "$ROOT" --plan "$PLAN_DIR/segments.json" \
   --video-mode symlink --out "$CLEAN_ROOT"
 ```
 
-默认 `symlink` 模式链接原始 MP4，因此必须保留原始视频目录。`--video-mode copy` 复制实际用到的共享 MP4，生成独立视频副本；复制的是原文件，不重新编码。
+导出不会跨异常间隙拼接。每个连续片段成为独立 episode，重新建立全局索引；每路视频起点为原始起点加 start_frame/fps。symlink 复用原始 MP4，原始视频必须保留；copy 复制实际用到的 MP4，生成视频副本。两种模式均不重新编码。
 
-每个保留片段成为一个新的 episode：
+片段内 state 数值保持原样，timestamp 减去首帧时间而保留时间差。导出要求完整源 episode 严格满足 action[t]=state[t+1][14:34]，源末帧为保持；其他记录约定会被拒绝。片段非末帧 action 保持原样，新末帧的完整 20 维 action 改为当前 state 的 14:34，避免目标指向段外或被剔除状态。这个终止保持规则会改变末帧动作，包括其姿态及夹爪标签，记录在 curation_source_map.json 中，需结合训练效果评估；它不属于平移异常判据。
 
-- 新 `episode_index/frame_index/index` 连续，task_index 保留原值。
-- 段内状态、关节、位姿及夹爪数值保持原样；timestamp 仅减去该段首帧时间，保持时间差。
-- 视频起点为 `原 episode 视频起点 + start_frame/fps`，每路相机分别计算；不会用采集 timestamp 直接索引共享 MP4。
-- 导出要求原始动作严格满足 `action[t]=state[t+1][14:34]`，原 episode 最后一行也为保持动作。其他动作记录约定会被拒绝，避免错误改写。
-- 对切段的新末帧，将 action 改为该帧的 `state[14:34]`，形成明确的终止保持，避免末帧动作仍指向被剔除或段外状态。它是本项目适配规则，会增加停止标签，需结合实际训练评估；不把它描述成论文原算法。
-- `curation_source_map.json` 记录新旧 episode/帧区间及末帧动作是否变化。
+导出前验证数据与元数据哈希，输出到临时目录，验证后发布；拒绝覆盖原始数据或已有目录。v1 计划与配置不能直接套用于 v2，请重新生成计划。v1 工具包保留为历史版本。
 
-导出前校验计划中的原始状态、动作、时间、任务与视频元数据哈希；导出后由实际 V3EpisodeReader 校验新枚举和下一帧动作约定。导出使用临时目录，验证通过后发布到目标目录；失败不会留下可误用的目标数据集。已有目标目录拒绝覆盖。
-
-## 训练前必须同步的文件
-
-导出不会把旧的 code、归一化统计、instruction_idx、cycle 或其他平面索引缓存复制到新根目录。直接沿用旧缓存会与新的全局帧索引错配。按新根目录重新生成这些缓存；生成代码时继续使用你已核对的 coding_v4 参数及无注释流程。
-
-先重新计算当前项目使用的相对动作统计，采用已验证的 project 聚合口径：
+新索引需要重建 code 和按帧/episode 索引的缓存；生成代码继续使用已确认的无注释流程。归一化统计按新根目录重新计算：
 
 ```bash
 CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" \
@@ -147,11 +119,7 @@ CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" \
   --out "$CLEAN_ROOT/dataset_stats_eef64.json"
 ```
 
-原本正确的 `dataset_stats_eef64.json` 不需要被覆盖；这里统计的是经过筛选的新数据分布。由于原项目按 episode 等权聚合，切分成多个片段也会改变权重。
-
-如果划分训练集与验证集，应按 `curation_source_map.json` 中的 `source_episode` 分组，避免同一原始轨迹的不同片段分别进入训练和验证；同时按照各自 loader 的实际枚举准备代码缓存。当前配置的 `val_set_proportion: 0.0` 会让两边读取同一数据，不能当作独立泛化评测。
-
-全量数值/视频复核完成后，再将训练配置中的数据根目录、统计路径、代码缓存及其他缓存路径指向新生成文件。静态任务文字到提示词的映射可以沿用，但按帧或 episode 编号索引的文件必须重建。模型效果应通过相同独立验证集和实际任务成功率比较，不以筛后峰值变低作为性能提升的证明。
+训练/验证应按 curation_source_map.json 的原始 source_episode 分组，避免同一原始轨迹的片段泄漏。完整数据、真实视频和训练效果仍需在服务器复核。
 
 ## 验证
 
@@ -160,4 +128,4 @@ PYTHONPATH="$PWD/src" "$PY" -m unittest discover \
   -s "$TOOL_DIR/tests" -p test_paper_trajectory_curation.py -v
 ```
 
-覆盖恒速、非均匀时间局部拟合、SO(3) 跨 ±180°、尖峰支持范围、完整状态重复、二值夹爪、切段丢失释放事件、坏时间、静止规则对纯旋转的影响、末帧保持、新旧动作对应、源文件哈希不变、过期计划拒绝和导出失败回收。合成三相机共享 MP4 的集成检查使用各自不同的视频起点，通过实际 v3 loader 解码片段首尾帧，确认视频像素一致且采样不会跨片段边界。验证范围为本项目 v3 loader，未验证其他 LeRobot 版本、完整真实数据集或 GPU 训练效果。
+包括平移联合判据、正常启停峰值、旋转变化不影响筛选、静止首尾裁剪、中间停顿、task 2 豁免、非均匀时间拟合、异常切段、三相机视频起点与实际 loader 解码、数据源不变、末帧保持、过期计划拒绝及失败回收。
