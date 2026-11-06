@@ -134,9 +134,14 @@ def detect_events(x: np.ndarray, *, open_is_high: bool, min_range: float,
                 candidate, count = None, 0
         else:
             candidate, count = None, 0
-    return events, {"range": round(span, 6), "low": round(low, 6),
-                    "high": round(high, 6), "initial": "open" if
-                    ((xs[0] > (lo + hi) / 2.0) == open_is_high) else "closed"}
+    info = {"range": round(span, 6), "low": round(low, 6),
+            "high": round(high, 6), "initial": "open" if
+            ((xs[0] > (lo + hi) / 2.0) == open_is_high) else "closed"}
+    if candidate is not None:
+        info["terminal_candidate"] = dict(state=candidate, samples=count,
+            first_frame=len(xs) - count, last_frame=len(xs) - 1,
+            required_samples=stable_frames)
+    return events, info
 
 
 def rot6d_to_matrix(raw: np.ndarray) -> np.ndarray:
@@ -210,37 +215,9 @@ def rotation_vector_from_matrix(R: np.ndarray) -> np.ndarray:
     return 0.5 * theta / math.sin(theta) * vee
 
 
-def measured_knob_rotation(states: np.ndarray, start: int, end: int, opts):
-    """Estimate gripper-local rotation while xyz is stationary, from state rot6D.
-
-    Returns a `robot.rotate` expression or None plus the audit record.  The
-    physical knob-axis and signed angle still require calibration: the robot API
-    assumes rotation about the gripper's approach axis.
-
-    Uses SUM of consecutive local SO(3) rotations, not R[start].T @ R[end],
-    so motions exceeding 180 degrees across *multiple frames* are retained.
-    """
-    i = max(0, min(int(start), len(states) - 1))
-    j = max(0, min(int(end), len(states) - 1))
-    meta = {"knob_angle_source": "estimated from consecutive left EEF rot6d",
-            "rotation_interval": [i, j],
-            "knob_axis_frame": "initial/local gripper (approximate)"}
-    if j <= i:
-        meta["warning"] = "insufficient sampled frames to estimate wrist rotation"
-        return None, meta
-    positions = np.asarray(states[i:j + 1, 14:17], dtype=float)
-    drift = float(np.max(np.linalg.norm(positions - positions[0], axis=1)))
-    meta["xyz_max_drift_m"] = round(drift, 5)
-    if not np.all(np.isfinite(positions)) or drift > opts.knob_max_xyz_drift_m:
-        meta["warning"] = "XYZ is not sufficiently stationary for a knob-in-place rotation"
-        return None, meta
-    try:
-        Rs = [rot6d_to_matrix(states[k, 17:23]) for k in range(i, j + 1)]
-        steps = np.asarray([rotation_vector_from_matrix(a.T @ b)
-                            for a, b in zip(Rs[:-1], Rs[1:])])
-    except ValueError as exc:
-        meta["warning"] = str(exc)
-        return None, meta
+def knob_rotation_from_steps(steps: np.ndarray, opts):
+    """Estimate the angle from retained consecutive local SO(3) increments."""
+    meta = {}
     motion_norms = np.linalg.norm(steps, axis=1)
     path_angle_deg = math.degrees(float(motion_norms.sum()))
     meta["rotation_path_deg"] = round(path_angle_deg, 2)
@@ -283,10 +260,79 @@ def measured_knob_rotation(states: np.ndarray, start: int, end: int, opts):
     return f"robot.rotate('temperature control knob', {angle_deg:.2f}, side='left')", meta
 
 
+def measured_knob_rotation(states: np.ndarray, start: int, end: int, opts):
+    """Use the full interval when valid; optionally refine an excessive-XYZ span.
+
+    Refinement never changes thresholds or reads an old audit. It enumerates
+    retained contiguous windows of at least three poses, applies the same XYZ,
+    angle and axis-coherence checks, then selects the greatest signed-angle
+    magnitude (longest window and earliest start break ties). Physical knob
+    engagement and the robot's angle sign still need calibration.
+    """
+    i = max(0, min(int(start), len(states) - 1))
+    j = max(0, min(int(end), len(states) - 1))
+    meta = {"knob_angle_source": "estimated from consecutive left EEF rot6d",
+            "rotation_interval": [i, j],
+            "knob_axis_frame": "initial/local gripper (approximate)"}
+    if j <= i:
+        return None, meta | {"warning": "insufficient sampled frames to estimate wrist rotation"}
+    positions = np.asarray(states[i:j + 1, 14:17], dtype=float)
+    if not np.isfinite(positions).all():
+        return None, meta | {"warning": "non-finite XYZ in knob interval"}
+    drift = float(np.max(np.linalg.norm(positions - positions[0], axis=1)))
+    meta["xyz_max_drift_m"] = round(drift, 5)
+    excessive = drift > opts.knob_max_xyz_drift_m
+    if excessive and not getattr(opts, "refine_knob_window", False):
+        return None, meta | {"warning": "XYZ is not sufficiently stationary for a knob-in-place rotation"}
+    try:
+        rotations = [rot6d_to_matrix(states[k, 17:23]) for k in range(i, j + 1)]
+        steps = np.asarray([rotation_vector_from_matrix(a.T @ b) for a, b in zip(rotations[:-1], rotations[1:])])
+    except ValueError as exc:
+        return None, meta | {"warning": str(exc)}
+    if not excessive:
+        code, estimate = knob_rotation_from_steps(steps, opts)
+        return code, meta | estimate
+
+    best, candidate_count = None, 0
+    min_frames = getattr(opts, "knob_refine_min_frames", 3)
+    summed = np.vstack((np.zeros(3), np.cumsum(steps, axis=0)))
+    for first in range(len(positions) - min_frames + 1):
+        excursions = np.maximum.accumulate(np.linalg.norm(positions[first:] - positions[first], axis=1))
+        for last in range(first + min_frames - 1, len(positions)):
+            window_drift = float(excursions[last - first])
+            if window_drift > opts.knob_max_xyz_drift_m:
+                break
+            # Any projection's net angle is bounded by the sum-vector norm.
+            if math.degrees(float(np.linalg.norm(summed[last] - summed[first]))) < opts.knob_min_angle_deg:
+                continue
+            code, estimate = knob_rotation_from_steps(steps[first:last], opts)
+            if code is None:
+                continue
+            candidate_count += 1
+            rank = (abs(estimate["estimated_signed_angle_deg"]), last - first, -first)
+            if best is None or rank > best[0]:
+                best = (rank, first, last, code, estimate, window_drift)
+    meta.update(rotation_window_refined=best is not None,
+                full_interval_exceeds_xyz_tolerance=True,
+                rotation_window_candidate_count=candidate_count,
+                rotation_window_selection="greatest absolute signed angle, then longest, then earliest")
+    if best is None:
+        return None, meta | {"warning": "no retained stationary rotation window passes angle/axis checks"}
+    _, first, last, code, estimate, window_drift = best
+    warning = "rotation window inferred from retained wrist motion; visually confirm knob engagement and signed-angle convention"
+    if estimate.get("warning"):
+        warning += "; " + estimate["warning"]
+    return code, meta | estimate | dict(rotation_window=[i + first, i + last],
+        rotation_window_xyz_drift_m=round(window_drift, 5),
+        rotation_window_active_steps=int(np.sum(np.linalg.norm(steps[first:last], axis=1) >= math.radians(.1))),
+        rotation_window_active_step_threshold_deg=.1, warning=warning)
+
+
 def make_code(lines: list[str], *, comment: str = "") -> str:
     if not lines:
         return ""
-    body = ([f"    # {comment}"] if comment else [])
+    # Keep the old keyword for callers, but explanations belong in the audit.
+    body = []
     for n, line in enumerate(lines):
         body.append("    " + ("return " if n == len(lines)-1 else "") + line)
     code = "def policy_chunk(obs, state, robot, skills):\n" + "\n".join(body) + "\n"
@@ -543,13 +589,21 @@ def code_for_task3_open_push(states: np.ndarray, opts):
     return spans, audit
 
 
-def label_episode(ep: int, ti: int, states: np.ndarray, opts):
+def label_episode(ep: int, ti: int, states: np.ndarray, opts, *, terminal_open_context=None):
     if ti not in TASKS:
         raise ValueError(f"Unexpected task_index={ti} in episode {ep}")
     active, _, _ = TASKS[ti]
     ev, info = detect_events(states[:, 32 if active == "left" else 33],
                              open_is_high=opts.open_is_high, min_range=opts.min_range,
                              stable_frames=opts.stable_frames)
+    if terminal_open_context is not None:
+        info["curation_boundary_confirmation"] = terminal_open_context
+        if terminal_open_context.get("confirmed"):
+            pending = info.get("terminal_candidate", {})
+            if (pending.get("state") != "open" or not ev or ev[-1][1] != "close"
+                    or terminal_open_context.get("retained_frames") != len(states)):
+                raise ValueError("Source boundary confirmation does not match pending retained opening")
+            ev.append((len(states) - 1, "open"))
     other, _ = detect_events(states[:, 33 if active == "left" else 32],
                              open_is_high=opts.open_is_high, min_range=opts.min_range,
                              stable_frames=opts.stable_frames)
@@ -628,6 +682,8 @@ def label_episode(ep: int, ti: int, states: np.ndarray, opts):
     # Zero events -> unlabelled, avoid pretending a grasp happened.
     assert sum(s["end"]-s["start"] for s in spans) == len(states)
     warnings = []
+    if info.get("terminal_candidate") and not (terminal_open_context or {}).get("confirmed"):
+        warnings.append("terminal gripper candidate lacks stable confirmation")
     if not ev:
         warnings.append("no active-arm gripper event")
     if other:
@@ -682,6 +738,10 @@ def main():
                     help="minimum signed rotation magnitude to emit robot.rotate")
     ap.add_argument("--knob-min-axis-coherence", type=float, default=0.8,
                     help="minimum consistency of incremental motion about the estimated/specified axis")
+    ap.add_argument("--refine-knob-window", action="store_true",
+                    help="if full knob interval exceeds XYZ drift, find a valid retained stationary subwindow")
+    ap.add_argument("--knob-refine-min-frames", type=int, default=3,
+                    help="minimum poses in a refined knob window; must be at least three")
     ap.add_argument("--audit", type=Path, default=None,
                     help="default: <dataset>/gripper_code_audit.jsonl")
     args = ap.parse_args()
@@ -695,6 +755,8 @@ def main():
         ap.error("knob drift/angle thresholds must be nonnegative")
     if not 0 <= args.knob_min_axis_coherence <= 1:
         ap.error("knob-min-axis-coherence must be in [0, 1]")
+    if args.knob_refine_min_frames < 3:
+        ap.error("knob-refine-min-frames must be >=3")
     root = args.dataset.resolve()
     info = json.loads((root / "meta/info.json").read_text())
     if info.get("codebase_version") != "v3.0":

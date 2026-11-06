@@ -1,5 +1,7 @@
 # LeRobot v3.0 Air Fryer Coding — targeted fixes after 4348-episode diagnostics
 
+Current generation: [custom code generator v2](docs/CUSTOM_CODE_GENERATOR_V2.md) reads the curated dataset directly without any old cache/audit, refines excessive-XYZ knob intervals with unchanged thresholds, and writes comment-free labels with release/place retreat merged. Optional curation source context confirms cropped terminal openings without using deleted source poses as targets. The base builder exposes this refinement through `--refine-knob-window`; its generated policy code no longer contains comments. The observations and commands below describe the earlier baseline workflow.
+
 This is a **modified copy** of `build_v3_gripper_code.py`, not a change to the original. It is intended for the four-task air-fryer dataset (34D state, 20D action, LeRobot v3.0 packed parquet), and it does not execute any program on the robot.
 
 ## What was observed

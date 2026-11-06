@@ -131,7 +131,7 @@ CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" \
 
 导出前验证数据与元数据哈希，输出到临时目录，验证后发布；拒绝覆盖原始数据或已有目录。v2.1 兼容已有 v2 计划并按计划中的原区间导出，报告记录 input_plan_version。若调整最短长度等筛选参数，需另建目录重新生成计划；v1 计划与配置仍不适用。
 
-新索引需要重建 code 和按帧/episode 索引的缓存；生成代码继续使用已确认的无注释流程。归一化统计按新根目录重新计算：
+新索引需要重建 code 和按帧/episode 索引的缓存；可使用[无需旧 audit 的新版代码生成器](CUSTOM_CODE_GENERATOR_V2.md)，从清洗后状态直接生成无注释代码、细化旋钮窗口并合并技能回撤。归一化统计按新根目录重新计算：
 
 ```bash
 CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" \
