@@ -1,5 +1,7 @@
 # 专家轨迹的速度、加速度与跳变检查
 
+当前交付包为 `custom-trajectory-audit-v2.zip`。v2 修复关节事件的夹爪上下文，并增加选定 episode 的原始数值导出；v1 的速度、加速度、jerk 数值计算不受此次修复影响。
+
 检查对象是原始 Parquet 中的完整 episode，不把训练 chunk 拼接起来求差分，也不对 code 中的稀疏目标坐标求导。custom 数据的两类轨迹要分别看：
 
 不直接对归一化的 64D 相对动作求导：每个 chunk 的参考位姿会变化，直接拼接会制造假跳变，应回到原始绝对位姿。
@@ -22,14 +24,14 @@ git fetch origin codex/custom-data-review-files
 git show FETCH_HEAD:scripts/audit_custom_trajectories.py > /tmp/audit_custom_trajectories.py
 ```
 
-也可下载 `deliveries/custom-trajectory-audit-v1.zip` 后解压。在项目根目录设置 `PYTHONPATH=src`，调用解压后的 scripts/audit_custom_trajectories.py；工具使用项目现有 V3EpisodeReader。核心依赖 NumPy、Pandas、PyArrow，不要求 SciPy。
+也可下载 `deliveries/custom-trajectory-audit-v2.zip` 后解压。在项目根目录设置 `PYTHONPATH=src`，调用解压后的 scripts/audit_custom_trajectories.py；工具使用项目现有 V3EpisodeReader。核心依赖 NumPy、Pandas、PyArrow，不要求 SciPy。
 
 ## 先检查四种任务的样本
 
 ```bash
 DATA_ROOT=/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30
 CUDA_VISIBLE_DEVICES="" PYTHONPATH=src "$PY" /tmp/audit_custom_trajectories.py \
-  --root "$DATA_ROOT" --episodes 0 1087 2174 3261 \
+  --root "$DATA_ROOT" --episodes 0 1 2 3261 \
   --out ./trajectory_audit_sample_v1
 ```
 
@@ -41,6 +43,8 @@ CUDA_VISIBLE_DEVICES="" PYTHONPATH=src "$PY" /tmp/audit_custom_trajectories.py \
 ```
 
 共享 Parquet 的选定列每文件读取一次，不重复为每个 episode 扫描同一文件。全部数值分析在 CPU 上执行。输出目录已存在时拒绝覆盖，请更换 `--out`。
+
+任务应以数据中的 task_index 为准，不能由 episode 编号范围推断。这里的 0、1、2、3261 是当前这份四任务数据的样本选择。
 
 ## 输出与判断
 
@@ -73,11 +77,25 @@ CUDA_VISIBLE_DEVICES="" PYTHONPATH=src "$PY" /tmp/audit_custom_trajectories.py \
 ```bash
 "$PY" -m pip install matplotlib
 CUDA_VISIBLE_DEVICES="" PYTHONPATH=src "$PY" /tmp/audit_custom_trajectories.py \
-  --root "$DATA_ROOT" --episodes 0 1087 2174 3261 \
-  --plot-episodes 0 1087 2174 3261 --out ./trajectory_audit_plots_v1
+  --root "$DATA_ROOT" --episodes 0 1 2 3261 \
+  --plot-episodes 0 1 2 3261 --out ./trajectory_audit_plots_v2
 ```
 
 每个 episode 输出一张独立 PNG，左右臂分别一列，显示平移与旋转的速度、加速度、jerk；state 与 action 叠加，灰线为夹爪切换。也可以先全量扫描，再将 events 中的可疑 episode 放入 `--episodes` 和 `--plot-episodes`。
+
+## 导出少量原始轨迹用于复核
+
+CSV 指标与 summary 是统计结果，无法替代逐帧的位姿、关节和目标值。选定需要复核的 episode 后，增加 `--export-raw`：
+
+```bash
+CUDA_VISIBLE_DEVICES="" PYTHONPATH=src "$PY" /tmp/audit_custom_trajectories.py \
+  --root "$DATA_ROOT" --episodes 0 1 --export-raw \
+  --out ./trajectory_raw_review_v2
+```
+
+新增的 `raw_episodes.json` 包含所选 episode 全部原始帧的 frame_index、task_index、timestamp、observation.state[34] 和 action[20]，不平滑、不重新采样。另有 analysis_time 字段，明确区分原始 timestamp 与 `--time-source fps` 的假设时间。非有限浮点值用字符串 nan/inf/-inf 表示，避免非标准 JSON。为避免意外导出全量数据，此选项要求显式提供 `--episodes`。
+
+v2 的 summary 新增 tool_version 和脚本 SHA256。v1 中 `state_joints` 事件的 near_gripper_transition 被默认写成 False，不能据此认定关节峰值远离夹爪切换；关节行的 gripper_transitions 也曾默认是 0。v2 改为使用同侧 state 的实际夹爪序列。v1 的 state/action 末端事件夹爪标记和所有运动指标数值不受此问题影响。
 
 ## 时间和差分约定
 
@@ -95,4 +113,4 @@ CUDA_VISIBLE_DEVICES="" PYTHONPATH=src "$PY" /tmp/audit_custom_trajectories.py \
 
 本地使用合成 v3 打包 Parquet 验证恒速、恒加速度、非均匀采样的常 jerk、方向反转、SO(3) 跨 ±180°、坏时间戳、大间隙、退化旋转、关节编码器跨界、夹爪切换、state/action 区分、单帧 episode、分任务统计、读取顺序、原始文件不变和 PNG 绘制。没有用户真实数据或机器人规格，不能据此报告真实数据已有跳变或确定根因。
 
-本地 18 项测试通过，包含非均匀时间下的平移/旋转常 jerk 和真实 PNG 输出。
+本地 20 项测试通过，包含非均匀时间下的平移/旋转常 jerk、真实 PNG 输出、关节/末端夹爪上下文一致性，以及原始值导出和假设时间区分。

@@ -1,6 +1,6 @@
 # Custom 数据代码审查交付包
 
-专家轨迹检查：`custom-trajectory-audit-v1.zip`，只读扫描实际位姿、目标位姿和关节，输出速度/加速度/jerk 候选点、时间戳问题及可选曲线图；不自动删除或平滑演示。见 [运行和解释结果](../docs/CUSTOM_TRAJECTORY_DYNAMICS.md)。
+专家轨迹检查：`custom-trajectory-audit-v2.zip`，只读扫描实际位姿、目标位姿和关节，输出速度/加速度/jerk 候选点、时间戳问题及可选曲线图；增加少量原始轨迹导出，修复 v1 关节夹爪上下文标记。旧 v1 包保留。见 [运行和解释结果](../docs/CUSTOM_TRAJECTORY_DYNAMICS.md)。
 
 256×448 图像适配包：`custom-image-letterbox-v2-256x448.zip`，包含 v1 功能，增加动态部署尺寸和一键同步尺寸配置。当前原图 `240×424` 不缩放，上下各补 8 行、左右各补 12 列；保留原始像素和现场路径。见 [安装和切换命令](../docs/CUSTOM_IMAGE_256X448.md)。
 

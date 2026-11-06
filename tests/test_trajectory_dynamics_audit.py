@@ -163,6 +163,23 @@ class DynamicsTests(unittest.TestCase):
         self.assertEqual(joints["scores"]["joint_step"][1], 358)
         self.assertEqual(joints["units"]["joint_speed"], "deg/s")
 
+    def test_joint_events_share_measured_gripper_context_with_the_same_arm(self):
+        t = np.arange(10)*.1
+        state, action = arrays(t)
+        state[3:, 32] = 1
+        state[7:, 33] = 1
+        state[4, 0] = 20
+        tracks, _ = audit.analyze_episode(0, state, action, t, np.zeros(10))
+        for side in ("left", "right"):
+            measured = next(x for x in tracks if x["source"] == "state" and x["side"] == side)
+            joint = next(x for x in tracks if x["source"] == "state_joints" and x["side"] == side)
+            np.testing.assert_equal(joint["grip"], measured["grip"])
+            np.testing.assert_equal(joint["grip_changed"], measured["grip_changed"])
+        _, _, events = audit.summarize(tracks, {"joint_speed": 100})
+        violations = [e for e in events if e["metric"] == "joint_speed" and e["limit_exceeded"]]
+        self.assertTrue(violations)
+        self.assertTrue(all(e["near_gripper_transition"] for e in violations))
+
     def test_only_command_spike_exceeds_limit_when_measured_state_is_smooth(self):
         t = np.arange(10)*.1
         state, action = arrays(t, x=.1*t)
@@ -196,6 +213,27 @@ class DynamicsTests(unittest.TestCase):
 
 
 class ReaderAndCliTests(unittest.TestCase):
+    def test_raw_export_preserves_recorded_values_and_separates_assumed_time(self):
+        with TemporaryDirectory() as tmp:
+            root = fixture(Path(tmp)/"dataset")
+            out = Path(tmp)/"report"
+            result = subprocess.run([sys.executable, str(SCRIPT), "--root", str(root), "--out", str(out),
+                "--episodes", "0", "--time-source", "fps", "--fps", "10", "--export-raw"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            exported = json.loads((out/"raw_episodes.json").read_text())
+            self.assertEqual(exported["joint_unit"], "stored")
+            frames = exported["episodes"][0]["frames"]
+            original = pd.read_parquet(root/"data/chunk-000/file-000.parquet")
+            original = original[original.episode_index == 0].sort_values("frame_index")
+            self.assertEqual(len(frames), len(original))
+            for row, (_, old) in zip(frames, original.iterrows()):
+                self.assertEqual(row["observation.state"], old["observation.state"].tolist())
+                self.assertEqual(row["action"], old["action"].tolist())
+                self.assertEqual(row["timestamp"], old["timestamp"])
+            self.assertAlmostEqual(frames[1]["timestamp"], .07)
+            self.assertAlmostEqual(frames[1]["analysis_time"], .1)
+            self.assertEqual(json.loads((out/"summary.json").read_text())["tool_version"], audit.TOOL_VERSION)
+
     def test_shared_parquet_is_read_once_and_episode_order_is_preserved(self):
         from agenticwam.datasets.lerobot.v3.episode_reader import V3EpisodeReader
         with TemporaryDirectory() as tmp:
@@ -227,10 +265,14 @@ class ReaderAndCliTests(unittest.TestCase):
             base = [sys.executable, str(SCRIPT), "--root", str(root)]
             missing = subprocess.run(base+["--out", str(Path(tmp)/"bad")], capture_output=True, text=True)
             self.assertNotEqual(missing.returncode, 0)
-            fixed = subprocess.run(base+["--out", str(Path(tmp)/"fixed"), "--time-source", "fps", "--fps", "10"], capture_output=True, text=True)
+            fixed = subprocess.run(base+["--out", str(Path(tmp)/"fixed"), "--time-source", "fps", "--fps", "10",
+                                         "--episodes", "0", "--export-raw"], capture_output=True, text=True)
             self.assertEqual(fixed.returncode, 0, fixed.stderr)
             report = json.loads((Path(tmp)/"fixed/summary.json").read_text())
             self.assertEqual(report["assumed_fps"], 10)
+            raw = json.loads((Path(tmp)/"fixed/raw_episodes.json").read_text())["episodes"][0]
+            self.assertFalse(raw["recorded_timestamp_available"])
+            self.assertTrue(all(frame["timestamp"] is None for frame in raw["frames"]))
 
     def test_cli_uses_recorded_time_instead_of_nominal_video_fps(self):
         with TemporaryDirectory() as tmp:

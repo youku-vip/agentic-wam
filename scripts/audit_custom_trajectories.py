@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import csv
+import hashlib
 import json
 from pathlib import Path
 import sys
 
 import numpy as np
 
+TOOL_VERSION = "custom-trajectory-audit-v2"
 
 EEF_UNITS = {
     "position_step": "m", "speed": "m/s", "velocity_change": "m/s",
@@ -185,9 +187,12 @@ def analyze_episode(episode, state, action, times, tasks, min_dt=1e-4, gap_facto
         units = {key: joint_unit + ("" if SUPPORT[key] == 1 and key == "joint_step" else
                  "/s" if key in ("joint_speed", "joint_velocity_change") else
                  "/s^2" if key == "joint_acceleration" else "/s^3") for key in scores}
+        grip = state[:, 32 if side == "left" else 33]
+        changed = np.zeros(n, dtype=bool)
+        changed[1:] = np.isfinite(grip[:-1]) & np.isfinite(grip[1:]) & (np.abs(np.diff(grip)) >= gripper_delta)
         tracks.append(dict(episode=episode, source="state_joints", side=side, times=times, tasks=tasks,
                            scores=scores, quality={"invalid_joint_frames": np.flatnonzero(~np.isfinite(values).all(1)).tolist()},
-                           grip=np.full(n, np.nan), grip_changed=np.zeros(n, dtype=bool), units=units,
+                           grip=grip, grip_changed=changed, units=units,
                            joint_indices=indices))
     return tracks, timing
 
@@ -262,7 +267,7 @@ def write_csv(path, rows, fields=None):
         writer.writerows(rows)
 
 
-def read_episodes(reader, selected, time_source):
+def read_episodes(reader, selected, time_source, include_timestamp=False):
     """Read selected packed Parquet columns once per file, never decode a video."""
     import pandas as pd
     import pyarrow.parquet as pq
@@ -271,9 +276,10 @@ def read_episodes(reader, selected, time_source):
         files[reader.data_file(episode)].append(episode)
     for path, episodes in files.items():
         columns = ["episode_index", "frame_index", "task_index", "observation.state", "action"]
-        if time_source == "timestamp":
+        available = set(pq.ParquetFile(path).schema_arrow.names)
+        if time_source == "timestamp" or (include_timestamp and "timestamp" in available):
             columns.append("timestamp")
-        missing = set(columns) - set(pq.ParquetFile(path).schema_arrow.names)
+        missing = set(columns) - available
         if missing:
             raise ValueError(f"{path}: missing columns {sorted(missing)}; use --time-source fps only if fixed physical timing is known")
         table = pd.read_parquet(path, columns=columns, filters=[("episode_index", "in", episodes)])
@@ -285,6 +291,20 @@ def read_episodes(reader, selected, time_source):
             if len(frame) != reader.episode_length(episode) or not np.array_equal(frame.frame_index.to_numpy(), np.arange(len(frame))):
                 raise ValueError(f"episode {episode}: invalid frame count/order")
             yield episode, frame
+
+
+def raw_episode_record(episode, frame, analysis_times):
+    """Preserve selected raw values; nonfinite numbers use explicit JSON strings."""
+    def number(value):
+        value = float(value)
+        return value if np.isfinite(value) else str(value)
+    return dict(episode=int(episode), recorded_timestamp_available="timestamp" in frame,
+        frames=[dict(frame_index=int(row["frame_index"]), task_index=int(row["task_index"]),
+            timestamp=number(row["timestamp"]) if "timestamp" in row else None,
+            analysis_time=number(time),
+            **{"observation.state": [number(v) for v in row["observation.state"]],
+               "action": [number(v) for v in row["action"]]})
+            for time, row in zip(analysis_times, frame.to_dict("records"))])
 
 
 def plot_episode(path, tracks):
@@ -326,9 +346,12 @@ def main():
     parser.add_argument("--joint-unit", choices=("stored", "rad", "deg"), default="stored", help="Declare stored joint units; does not convert or unwrap them")
     parser.add_argument("--gripper-delta", type=float, default=.5)
     parser.add_argument("--plot-episodes", type=int, nargs="+", help="Optional PNG plots; requires matplotlib")
+    parser.add_argument("--export-raw", action="store_true", help="Export all raw frames of explicitly selected --episodes to raw_episodes.json")
     args = parser.parse_args()
     if args.out.exists():
         parser.error("Output path already exists; choose a new --out directory")
+    if args.export_raw and not args.episodes:
+        parser.error("--export-raw requires explicit --episodes to avoid an accidental full-dataset export")
     if args.time_source == "fps" and (args.fps is None or not np.isfinite(args.fps) or args.fps <= 0):
         parser.error("--time-source fps requires an explicit positive --fps; encoded video fps is not physical timing evidence")
     if args.time_source == "timestamp" and args.fps is not None:
@@ -351,17 +374,20 @@ def main():
         parser.error("--episodes includes unknown episode IDs")
     if args.plot_episodes and set(args.plot_episodes) - set(selected):
         parser.error("--plot-episodes must be included in the selected episodes")
-    tracks, timing = [], {}
-    for number, (episode, frame) in enumerate(read_episodes(reader, selected, args.time_source), start=1):
+    tracks, timing, raw_records = [], {}, []
+    for number, (episode, frame) in enumerate(read_episodes(reader, selected, args.time_source, include_timestamp=args.export_raw), start=1):
         times = frame.timestamp.to_numpy(dtype=float) if args.time_source == "timestamp" else np.arange(len(frame)) / args.fps
         episode_tracks, timing[episode] = analyze_episode(episode, np.stack(frame["observation.state"]),
             np.stack(frame.action), times, frame.task_index.to_numpy(), args.min_dt, args.gap_factor,
             args.gripper_delta, args.joint_unit)
         tracks.extend(episode_tracks)
+        if args.export_raw:
+            raw_records.append(raw_episode_record(episode, frame, times))
         if number % 100 == 0 or number == len(selected):
             print(f"[trajectory-audit] analyzed {number}/{len(selected)} episodes", file=sys.stderr, flush=True)
     baselines, rows, events = summarize(tracks, limits, args.mad_k, args.top_k)
-    report = dict(episodes=len(selected), frames=sum(reader.episode_length(ep) for ep in selected),
+    report = dict(tool_version=TOOL_VERSION, script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        episodes=len(selected), frames=sum(reader.episode_length(ep) for ep in selected),
         root=str(reader.root), time_source=args.time_source, assumed_fps=args.fps,
         task_names=reader.tasks, min_dt=args.min_dt, gap_factor=args.gap_factor, joint_unit=args.joint_unit,
         limits=limits, has_robot_limits=bool(limits), exported_events=len(events), event_cap_per_metric=args.top_k,
@@ -376,12 +402,18 @@ def main():
                "SO(3) increments use the fixed reference frame and shortest arc; rotations above pi between samples are ambiguous.",
                "No smoothing, cross-episode differences, padding, normalization or video decoding is used.",
                "Joint angles are not unwrapped; confirm units and continuous-joint encoder wrapping.",
+               "Joint gripper-context flags use that arm's measured gripper transitions (fixed in v2).",
                "Candidate/violation counts are metric points; one frame can be counted by several metrics.",
                "Derivatives amplify quantization/noise; inspect neighboring frames and contact/gripper events before changing data."])
     args.out.mkdir(parents=True)
     write_csv(args.out / "episode_metrics.csv", rows)
     write_csv(args.out / "events.csv", events, EVENT_FIELDS)
     (args.out / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
+    if args.export_raw:
+        (args.out / "raw_episodes.json").write_text(json.dumps(dict(tool_version=TOOL_VERSION,
+            data_root=str(reader.root), time_source_for_analysis=args.time_source, assumed_fps=args.fps,
+            nominal_metadata_fps=reader.fps, joint_unit=args.joint_unit,
+            episodes=raw_records), ensure_ascii=False, allow_nan=False) + "\n")
     for episode in args.plot_episodes or []:
         current = [track for track in tracks if track["episode"] == episode]
         plot_episode(args.out / f"episode_{episode:06d}.png", current)
