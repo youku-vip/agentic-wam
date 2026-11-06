@@ -1,5 +1,7 @@
 # Custom 数据代码审查交付包
 
+完整生成流程：`custom-code-generator-v2-complete.zip`，包含一键 Bash 入口和 v2 生成源码，自动检查依赖、准备工具、生成新目录、回读验证缓存并打印训练路径。生成算法不变。见[下载和执行命令](../docs/CUSTOM_CODE_DATA_SCRIPT.md)。
+
 直接生成代码：`custom-code-generator-v2.zip`。从清洗后数据的实际状态重新生成，包含旋钮窗口细化、无注释 policy code 和 release/place 回撤合并；无需任何旧 cache/audit。可通过清洗映射读取少量源夹爪上下文来确认截断边界开爪。见[完整命令与校验范围](../docs/CUSTOM_CODE_GENERATOR_V2.md)。
 
 清洗后旋钮代码修复：`custom-curated-knob-code-repair-v1.zip`。利用原 audit 中完整保留的细化旋转窗口，逐条核对真实新旧 Parquet 姿态并复算角度；边界释放需源夹爪确认。写入新缓存目录，不覆盖数据、统计或现场配置。见 [诊断、校验和运行命令](../docs/CURATED_KNOB_CODE_REPAIR.md)。

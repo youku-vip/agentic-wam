@@ -1,5 +1,7 @@
 # 直接从清洗后数据生成代码：无需旧 audit
 
+需要一次执行环境检查、工具准备、生成和保存后核对时，可使用[一键完整脚本](CUSTOM_CODE_DATA_SCRIPT.md)。它默认创建带时间的新目录，保留此前已经生成的结果。
+
 旧 `coding_v3/gripper_code_audit.jsonl` 已删除时，使用本工具重新生成，不再使用依赖 `--reference-audit` 的缓存修补命令。输入只需清洗后的数据集；不加载任何旧 PT、order 或 audit。
 
 ## 生成方式

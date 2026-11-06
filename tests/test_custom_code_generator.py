@@ -240,3 +240,56 @@ def test_boundary_confirmation_needs_matching_states_and_actual_future_open(data
     assert proof["confirmed"] is False
     _, record = builder.label_episode(4, 2, current[4], options(), terminal_open_context=proof)
     assert [c[0] for s in record["spans"] for c in calls(s["code"])] == ["grasp", "rotate"]
+
+
+def shell_environment(root, tool, out):
+    return dict(os.environ, PROJECT_DIR=str(REPO), PY=sys.executable, CLEAN_ROOT=str(root),
+                TOOL_DIR=str(tool), OUT_DIR=str(out), CONFIRM_CURATED_BOUNDARIES="1",
+                KNOB_AXIS="auto", KNOB_ANGLE_SIGN="1")
+
+
+def test_shell_entrypoint_generates_verifies_and_preserves_existing_output(datasets, tmp_path):
+    source, root, _, _ = datasets
+    out = tmp_path / "complete-cache"
+    before_source, before_root = snapshot(source), snapshot(root)
+    command = ["bash", str(REPO / "scripts/generate_custom_code_data.sh")]
+    environment = shell_environment(root, REPO, out)
+    result = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, env=environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert '"saved_cache_checks": "passed"' in result.stdout
+    assert "data.code_cache=" + str(out / "policy_code_idx_custom.pt") in result.stdout
+    assert snapshot(source) == before_source
+    assert snapshot(root) == before_root
+    before_output = snapshot(out)
+    repeated = subprocess.run(command, capture_output=True, text=True, cwd=tmp_path, env=environment)
+    assert repeated.returncode != 0
+    assert "输出目录已存在" in repeated.stderr
+    assert snapshot(out) == before_output
+
+
+def test_shell_bootstrap_installs_verified_zip_without_network(datasets, tmp_path):
+    _, root, _, _ = datasets
+    tool, out = tmp_path / "installed-tool", tmp_path / "bootstrapped-cache"
+    environment = shell_environment(root, tool, out)
+    environment["CODEGEN_PACKAGE_URL"] = (REPO / "deliveries/custom-code-generator-v2.zip").as_uri()
+    result = subprocess.run(["bash", str(REPO / "scripts/generate_custom_code_data.sh")],
+        capture_output=True, text=True, cwd=tmp_path, env=environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tool / "MANIFEST.json").is_file()
+    assert (out / "policy_code_idx_custom.pt").is_file()
+    assert '"saved_cache_checks": "passed"' in result.stdout
+
+
+def test_shell_bootstrap_rejects_bad_download_without_publishing_tools(datasets, tmp_path):
+    _, root, _, _ = datasets
+    bad = tmp_path / "bad-package.zip"
+    bad.write_bytes(b"This is not the approved tool package")
+    tool, out = tmp_path / "unpublished-tool", tmp_path / "unpublished-cache"
+    environment = shell_environment(root, tool, out)
+    environment["CODEGEN_PACKAGE_URL"] = bad.as_uri()
+    result = subprocess.run(["bash", str(REPO / "scripts/generate_custom_code_data.sh")],
+        capture_output=True, text=True, cwd=tmp_path, env=environment)
+    assert result.returncode != 0
+    assert "SHA256 不匹配" in result.stderr
+    assert not tool.exists()
+    assert not out.exists()
