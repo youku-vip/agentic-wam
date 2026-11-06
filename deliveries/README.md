@@ -1,5 +1,7 @@
 # Custom 数据代码审查交付包
 
+专家轨迹检查：`custom-trajectory-audit-v1.zip`，只读扫描实际位姿、目标位姿和关节，输出速度/加速度/jerk 候选点、时间戳问题及可选曲线图；不自动删除或平滑演示。见 [运行和解释结果](../docs/CUSTOM_TRAJECTORY_DYNAMICS.md)。
+
 256×448 图像适配包：`custom-image-letterbox-v2-256x448.zip`，包含 v1 功能，增加动态部署尺寸和一键同步尺寸配置。当前原图 `240×424` 不缩放，上下各补 8 行、左右各补 12 列；保留原始像素和现场路径。见 [安装和切换命令](../docs/CUSTOM_IMAGE_256X448.md)。
 
 图像比例修复包：`custom-image-letterbox-v1.zip`。在保持模型输入 `224×320` 的情况下等比例缩放并补边，同步训练、验证和部署；默认保留旧 stretch 行为，需显式启用。安装器备份源码并保留现场 YAML/`train.sh`，配置工具只修改两个 processor 的 resize mode。见 [安装、启用和回退](../docs/CUSTOM_IMAGE_LETTERBOX.md)。
