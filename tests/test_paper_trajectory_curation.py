@@ -240,6 +240,34 @@ class NumericCurationTests(unittest.TestCase):
         self.assertEqual(fraction, 1)
         self.assertIsNone(why)
 
+    def test_short_idle_window_is_unknown_and_separate_from_length_rejection(self):
+        original = frame(n=25)
+        original["task_index"] = 0
+        settings = json.loads(curation.DEFAULT_CONFIG.read_text())
+        record, _, _ = curation.analyze(5, original, settings)
+        self.assertEqual(record["bad_frames"], [])
+        self.assertEqual(record["retention_status"], "fully_dropped")
+        self.assertEqual(record["dropped_segments"][0]["reason"], "short_segment")
+        self.assertEqual(record["dropped_segments"][0]["idle_evaluation"], "insufficient_window")
+        self.assertIsNone(record["dropped_segments"][0]["active_fraction"])
+
+    def test_explicitly_allowed_short_clips_are_not_rejected_by_idle_window(self):
+        for moving in (True, False):
+            with self.subTest(moving=moving):
+                original = frame(n=25)
+                original["task_index"] = 0
+                if not moving:
+                    state = np.stack(original["observation.state"])
+                    state[:, 14] = 0
+                    original["observation.state"] = list(state)
+                    original["action"] = list(np.r_[state[1:, 14:34], state[-1:, 14:34]])
+                settings = json.loads(curation.DEFAULT_CONFIG.read_text())
+                settings["min_segment_frames"] = 16
+                record, _, _ = curation.analyze(5, original, settings)
+                self.assertEqual(record["retention_status"], "fully_retained")
+                self.assertEqual(record["retained_segments"][0]["frames"], 25)
+                self.assertEqual(record["retained_segments"][0]["idle_evaluation"], "insufficient_window")
+
     def test_preview_preserves_all_poses_and_interior_actions(self):
         original = frame(spike=40)
         result, _, _ = curation.analyze(5, original, config())
@@ -307,6 +335,10 @@ class ExportTests(unittest.TestCase):
             cli("plan", "--root", root, "--out", plan)
             document = json.loads((plan / "segments.json").read_text())
             self.assertEqual(len(document["segments"]), 3)
+            summary = json.loads((plan / "summary.json").read_text())
+            self.assertEqual(summary["source_retention_counts"], {"partially_retained": 1, "fully_retained": 1})
+            self.assertEqual(summary["other_dropped_frames"],
+                sum(summary["dropped_segment_frames_by_reason"].values()) + summary["idle_trimmed_edge_frames"])
             cli("export", "--root", root, "--plan", plan / "segments.json", "--out", out)
             original, exported = V3EpisodeReader(root), V3EpisodeReader(out)
             mapping = json.loads((out / "curation_source_map.json").read_text())
@@ -337,6 +369,15 @@ class ExportTests(unittest.TestCase):
                         self.assertTrue(all(sample[key + "_is_pad"][1] for key in original.video_keys))
             self.assertEqual(before, {p.relative_to(root): curation.sha_file(p) for p in root.rglob("*") if p.is_file()})
             self.assertNotEqual(cli("export", "--root", root, "--plan", plan / "segments.json", "--out", out, success=False).returncode, 0)
+            legacy = copy.deepcopy(document)
+            legacy["version"] = "custom-paper-curation-v2-translation"
+            legacy_path = base / "legacy-v2.json"
+            legacy_path.write_text(json.dumps(legacy))
+            legacy_out = base / "legacy-clean"
+            cli("export", "--root", root, "--plan", legacy_path, "--out", legacy_out)
+            legacy_report = json.loads((legacy_out / "curation_export_report.json").read_text())
+            self.assertEqual(legacy_report["input_plan_version"], "custom-paper-curation-v2-translation")
+            self.assertEqual(legacy_report["frames"], exported.total_frames)
 
     def test_export_refuses_stale_source_before_creating_output(self):
         with TemporaryDirectory() as directory:

@@ -23,7 +23,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from audit_custom_trajectories import differences, read_episodes, time_edges
 
-VERSION = "custom-paper-curation-v2-translation"
+VERSION = "custom-paper-curation-v2.1-translation"
+COMPATIBLE_PLAN_VERSIONS = {VERSION, "custom-paper-curation-v2-translation"}
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs/trajectory_curation.example.json"
 METRICS = {"position_residual": (0, "m"), "position_step": (1, "m"), "acceleration": (2, "m/s^2"),
            "jerk": (3, "m/s^3")}
@@ -145,7 +146,9 @@ def trim_idle(state, start, stop, config, task_index=None):
         return start, stop, None, None
     width = config["window_frames"]
     if stop - start < width:
-        return start, stop, None, "idle_window_too_short"
+        # Insufficient evidence for idle classification. The independent
+        # min_segment_frames rule below decides whether to retain this piece.
+        return start, stop, None, None
     active = []
     for index in range(start, stop - width + 1):
         ranges = [np.linalg.norm(np.ptp(state[index:index + width, off:off + 3], axis=0)) for off in (14, 23)]
@@ -212,16 +215,26 @@ def analyze(episode, frame, config):
             events.append(event)
     kept, dropped = [], []
     for start, stop in runs(~bad):
+        if not config["idle"]["enabled"]:
+            idle_evaluation = "disabled"
+        elif int(tasks[0]) in config["idle"]["skip_task_indices"]:
+            idle_evaluation = "skipped_task"
+        elif stop - start < config["idle"]["window_frames"]:
+            idle_evaluation = "insufficient_window"
+        else:
+            idle_evaluation = "evaluated"
         begin, end, active_fraction, why = trim_idle(state, start, stop, config["idle"], int(tasks[0]))
         if why is None and end - begin < config["min_segment_frames"]:
             why = "short_segment"
         item = dict(source_episode=episode, task_index=int(tasks[0]), start_frame=begin, end_frame=end,
-                    frames=end - begin, active_fraction=active_fraction)
+                    frames=end - begin, active_fraction=active_fraction, idle_evaluation=idle_evaluation)
         if why:
             dropped.append(dict(**item, reason=why))
         else:
             kept.append(item)
     target = np.concatenate((state[1:, 14:34], state[-1:, 14:34]), axis=0)
+    kept_frames = sum(segment["frames"] for segment in kept)
+    retention_status = "fully_dropped" if not kept else "fully_retained" if kept_frames == n else "partially_retained"
     gripper_coverage = {}
     for side, column in (("left", 32), ("right", 33)):
         grip = state[:, column]
@@ -234,7 +247,7 @@ def analyze(episode, frame, config):
         next_state_action_exact=bool(np.array_equal(action, target)),
         bad_frames=np.flatnonzero(bad).tolist(),
         retained_segments=kept, dropped_segments=dropped, timing=timing,
-        gripper_transition_coverage=gripper_coverage), events, reasons
+        retention_status=retention_status, gripper_transition_coverage=gripper_coverage), events, reasons
 
 
 def load_raw(path):
@@ -378,6 +391,18 @@ def make_plan(args):
         episodes_with_missing_gripper_transitions=[r["episode"] for r in records
             if any(item["missing_transition_frames"] for item in r["gripper_transition_coverage"].values())],
         thresholds_are="Explicit local examples, not author settings or robot hardware limits.")
+    dropped_by_reason = Counter()
+    for record in records:
+        for segment in record["dropped_segments"]:
+            dropped_by_reason[segment["reason"]] += segment["frames"]
+    summary["dropped_segment_frames_by_reason"] = dict(sorted(dropped_by_reason.items()))
+    summary["idle_trimmed_edge_frames"] = summary["other_dropped_frames"] - sum(dropped_by_reason.values())
+    summary["source_retention_counts"] = dict(Counter(record["retention_status"] for record in records))
+    summary["fully_dropped_source_episodes"] = [record["episode"] for record in records
+                                                if record["retention_status"] == "fully_dropped"]
+    summary["partially_retained_with_missing_gripper_transitions"] = [record["episode"] for record in records
+        if record["retention_status"] == "partially_retained" and any(
+            item["missing_transition_frames"] for item in record["gripper_transition_coverage"].values())]
     args.out.mkdir(parents=True, exist_ok=False)
     write_json(args.out / "segments.json", document)
     write_json(args.out / "summary.json", summary)
@@ -406,8 +431,8 @@ def export_dataset(args):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
     from agenticwam.datasets.lerobot.v3.episode_reader import V3EpisodeReader
     document = json.loads(args.plan.read_text(encoding="utf-8"))
-    if document.get("version") != VERSION or document["source"]["kind"] != "lerobot_v3":
-        raise ValueError("Export requires a matching v2 translation plan from this LeRobot v3 dataset, not raw JSON or v1")
+    if document.get("version") not in COMPATIBLE_PLAN_VERSIONS or document["source"]["kind"] != "lerobot_v3":
+        raise ValueError("Export requires a v2/v2.1 translation plan from this LeRobot v3 dataset, not raw JSON or v1")
     records = validate_segments(document)
     if not document["segments"]:
         raise ValueError("Plan retains no segments; review thresholds before exporting")
@@ -519,7 +544,8 @@ def materialize_dataset(args, document, records, reader, published_out):
         target = np.concatenate((state[1:, 14:34], state[-1:, 14:34]), axis=0)
         if not np.array_equal(action, target):
             raise ValueError("Exported next-state action verification failed")
-    report = dict(version=VERSION, episodes=len(metadata), frames=offset, terminal_actions_changed=terminal_changes,
+    report = dict(version=VERSION, input_plan_version=document["version"], episodes=len(metadata), frames=offset,
+        terminal_actions_changed=terminal_changes,
         video_mode=args.video_mode, output=str(published_out),
         source_untouched=True, required_before_training=["Recompute relative-action normalization statistics on this new root.",
         "Regenerate code and every frame/episode-indexed cache for the new enumeration.",
