@@ -198,7 +198,7 @@ def generate(root, out, opts, confirm_boundaries=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", type=Path, required=True, help="Primary dataset: the curated root")
+    parser.add_argument("--root", type=Path, required=True, help="Primary dataset: an original or curated custom34 root")
     parser.add_argument("--out-dir", type=Path, required=True, help="New output directory")
     parser.add_argument("--confirm-curation-boundaries", action="store_true",
         help="Read source gripper context via curation metadata only for unconfirmed cropped openings; no old audit needed")

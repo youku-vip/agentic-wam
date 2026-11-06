@@ -243,9 +243,11 @@ def test_boundary_confirmation_needs_matching_states_and_actual_future_open(data
 
 
 def shell_environment(root, tool, out):
-    return dict(os.environ, PROJECT_DIR=str(REPO), PY=sys.executable, CLEAN_ROOT=str(root),
-                TOOL_DIR=str(tool), OUT_DIR=str(out), CONFIRM_CURATED_BOUNDARIES="1",
-                KNOB_AXIS="auto", KNOB_ANGLE_SIGN="1")
+    environment = dict(os.environ, PROJECT_DIR=str(REPO), PY=sys.executable, CLEAN_ROOT=str(root),
+                       TOOL_DIR=str(tool), OUT_DIR=str(out), CONFIRM_CURATED_BOUNDARIES="1",
+                       KNOB_AXIS="auto", KNOB_ANGLE_SIGN="1")
+    environment.pop("DATA_ROOT", None)
+    return environment
 
 
 def test_shell_entrypoint_generates_verifies_and_preserves_existing_output(datasets, tmp_path):
@@ -292,4 +294,40 @@ def test_shell_bootstrap_rejects_bad_download_without_publishing_tools(datasets,
     assert result.returncode != 0
     assert "SHA256 不匹配" in result.stderr
     assert not tool.exists()
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("kind,setting,expected_confirm", [("raw", "auto", False), ("curated", "auto", True), ("curated", "0", False)])
+def test_shell_supports_raw_and_curated_with_automatic_boundary_mode(datasets, tmp_path, kind, setting, expected_confirm):
+    raw, clean, _, _ = datasets
+    root = raw if kind == "raw" else clean
+    out = tmp_path / "cache-with-mode"
+    before_raw, before_clean = snapshot(raw), snapshot(clean)
+    environment = shell_environment(clean, REPO, out)
+    # A stale legacy CLEAN_ROOT must not override the explicitly selected input.
+    environment["DATA_ROOT"] = str(root)
+    environment["CONFIRM_CURATED_BOUNDARIES"] = setting
+    result = subprocess.run(["bash", str(REPO / "scripts/generate_custom_code_data.sh")],
+        capture_output=True, text=True, cwd=tmp_path, env=environment)
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((out / "code_generation_report.json").read_text())
+    assert report["dataset_root"] == str(root)
+    assert report["source_context_requested"] is expected_confirm
+    assert len(report["boundary_open_confirmations"]) == int(expected_confirm)
+    assert report["frames"] == (160 if kind == "raw" else 154)
+    assert len(report["unresolved_terminal_candidates"]) == int(kind == "curated" and not expected_confirm)
+    assert f"dataset_kind={kind} confirm_curated_boundaries={int(expected_confirm)}" in result.stdout
+    assert snapshot(raw) == before_raw
+    assert snapshot(clean) == before_clean
+
+
+def test_shell_rejects_forced_curation_confirmation_for_raw_input(datasets, tmp_path):
+    raw, _, _, _ = datasets
+    out = tmp_path / "not-generated"
+    environment = shell_environment(raw, REPO, out)
+    environment["DATA_ROOT"] = str(raw)
+    result = subprocess.run(["bash", str(REPO / "scripts/generate_custom_code_data.sh")],
+        capture_output=True, text=True, cwd=tmp_path, env=environment)
+    assert result.returncode != 0
+    assert "缺少清洗映射" in result.stderr
     assert not out.exists()

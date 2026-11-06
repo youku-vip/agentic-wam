@@ -1,6 +1,8 @@
 # Custom 数据代码审查交付包
 
-完整生成流程：`custom-code-generator-v2-complete.zip`，包含一键 Bash 入口和 v2 生成源码，自动检查依赖、准备工具、生成新目录、回读验证缓存并打印训练路径。生成算法不变。见[下载和执行命令](../docs/CUSTOM_CODE_DATA_SCRIPT.md)。
+原始/清洗后数据通用完整流程：`custom-code-generator-v3-complete.zip`，通过 DATA_ROOT 选择输入，自动判断是否需要清洗边界确认；兼容原来的 CLEAN_ROOT 参数。包含一键脚本及完整生成源码，算法仍为 v2。见[两种数据的运行命令](../docs/CUSTOM_CODE_DATA_SCRIPT.md)。
+
+旧版完整流程：`custom-code-generator-v2-complete.zip` 保留，默认面向清洗后数据。
 
 直接生成代码：`custom-code-generator-v2.zip`。从清洗后数据的实际状态重新生成，包含旋钮窗口细化、无注释 policy code 和 release/place 回撤合并；无需任何旧 cache/audit。可通过清洗映射读取少量源夹爪上下文来确认截断边界开爪。见[完整命令与校验范围](../docs/CUSTOM_CODE_GENERATOR_V2.md)。
 

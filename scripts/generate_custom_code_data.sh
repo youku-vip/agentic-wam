@@ -4,9 +4,9 @@ set -euo pipefail
 
 PROJECT_DIR="${PROJECT_DIR:-/data/algorithm/agentic-wam}"
 PY="${PY:-/usr/local/bin/python3.11}"
-CLEAN_ROOT="${CLEAN_ROOT:-/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30_translation_v2}"
-OUT_DIR="${OUT_DIR:-$CLEAN_ROOT/coding_v4_regenerated_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)}"
-CONFIRM_CURATED_BOUNDARIES="${CONFIRM_CURATED_BOUNDARIES:-1}"
+DATA_ROOT="${DATA_ROOT:-${CLEAN_ROOT:-/data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30_translation_v2}}"
+OUT_DIR="${OUT_DIR:-$DATA_ROOT/coding_v4_regenerated_$(TZ=Asia/Shanghai date +%Y%m%d_%H%M%S)}"
+CONFIRM_CURATED_BOUNDARIES="${CONFIRM_CURATED_BOUNDARIES:-auto}"
 KNOB_AXIS="${KNOB_AXIS:-auto}"
 KNOB_ANGLE_SIGN="${KNOB_ANGLE_SIGN:-1}"
 CODEGEN_PACKAGE_URL="${CODEGEN_PACKAGE_URL:-https://github.com/youku-vip/agentic-wam/raw/09f23b52ce20131e7890f11ad1fe1effa8dcd10a/deliveries/custom-code-generator-v2.zip}"
@@ -21,9 +21,9 @@ has_generator() {
 
 command -v "$PY" >/dev/null || fail "Python 不可用：$PY"
 [[ -d "$PROJECT_DIR/src" ]] || fail "项目 src 目录不存在：$PROJECT_DIR/src"
-[[ -f "$CLEAN_ROOT/meta/info.json" ]] || fail "数据集元数据不存在：$CLEAN_ROOT/meta/info.json"
+[[ -f "$DATA_ROOT/meta/info.json" ]] || fail "数据集元数据不存在：$DATA_ROOT/meta/info.json"
 [[ ! -e "$OUT_DIR" && ! -L "$OUT_DIR" ]] || fail "输出目录已存在，请通过 OUT_DIR 指定新目录：$OUT_DIR"
-[[ "$CONFIRM_CURATED_BOUNDARIES" == 0 || "$CONFIRM_CURATED_BOUNDARIES" == 1 ]] || fail "CONFIRM_CURATED_BOUNDARIES 只能为 0 或 1"
+[[ "$CONFIRM_CURATED_BOUNDARIES" == auto || "$CONFIRM_CURATED_BOUNDARIES" == 0 || "$CONFIRM_CURATED_BOUNDARIES" == 1 ]] || fail "CONFIRM_CURATED_BOUNDARIES 只能为 auto、0 或 1"
 
 BUNDLED_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -z "${TOOL_DIR:-}" ]]; then
@@ -42,23 +42,31 @@ cd -- "$PROJECT_DIR"
 export PYTHONPATH="$PROJECT_DIR/src${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=""
 
-"$PY" - "$CLEAN_ROOT" "$WORK_DIR/input_hashes.json" "$CONFIRM_CURATED_BOUNDARIES" <<'PY'
+"$PY" - "$DATA_ROOT" "$WORK_DIR/input_hashes.json" "$CONFIRM_CURATED_BOUNDARIES" "$WORK_DIR/input_mode.txt" <<'PY'
 import hashlib, importlib, json, sys
 from pathlib import Path
 for module in ("numpy", "torch", "pandas", "pyarrow"):
     importlib.import_module(module)
-root, destination, confirm = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3] == "1"
+root, destination, requested = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
 info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
 if info.get("codebase_version") != "v3.0":
     raise SystemExit("输入必须是 LeRobot v3.0 数据集")
+has_map = (root / "curation_source_map.json").is_file()
+has_source = bool(info.get("trajectory_curation", {}).get("source_root"))
+if requested == "auto" and has_map != has_source:
+    raise SystemExit("清洗元数据不完整：请补齐映射/source_root，或设置 CONFIRM_CURATED_BOUNDARIES=0 仅使用当前数据")
+confirm = has_map and has_source if requested == "auto" else requested == "1"
+kind = "curated" if has_map or has_source else "raw"
 if confirm:
     importlib.import_module("agenticwam.datasets.lerobot.v3.episode_reader")
-    if not (root / "curation_source_map.json").is_file() or not info.get("trajectory_curation", {}).get("source_root"):
+    if not has_map or not has_source:
         raise SystemExit("缺少清洗映射或 source_root；仅使用保留数据时设置 CONFIRM_CURATED_BOUNDARIES=0")
+Path(sys.argv[4]).write_text(f"{int(confirm)} {kind}\n", encoding="utf-8")
 names = ("meta/info.json", "curation_source_map.json", "dataset_stats_eef64.json")
 destination.write_text(json.dumps({name: hashlib.sha256((root / name).read_bytes()).hexdigest()
     for name in names if (root / name).is_file()}), encoding="utf-8")
 PY
+read -r RESOLVED_CONFIRM DATASET_KIND < "$WORK_DIR/input_mode.txt"
 
 if ! has_generator "$TOOL_DIR"; then
     [[ ! -e "$TOOL_DIR" && ! -L "$TOOL_DIR" ]] || fail "工具目录不完整，请指定新的 TOOL_DIR：$TOOL_DIR"
@@ -93,20 +101,21 @@ except BaseException:
 PY
 fi
 
-printf '[codegen] 数据集：%s\n' "$CLEAN_ROOT"
+printf '[codegen] 数据集：%s\n' "$DATA_ROOT"
+printf '[codegen] dataset_kind=%s confirm_curated_boundaries=%s\n' "$DATASET_KIND" "$RESOLVED_CONFIRM"
 printf '[codegen] 输出目录：%s\n' "$OUT_DIR"
-ARGS=(--root "$CLEAN_ROOT" --out-dir "$OUT_DIR" --knob-axis "$KNOB_AXIS" --knob-angle-sign "$KNOB_ANGLE_SIGN")
-if [[ "$CONFIRM_CURATED_BOUNDARIES" == 1 ]]; then
+ARGS=(--root "$DATA_ROOT" --out-dir "$OUT_DIR" --knob-axis "$KNOB_AXIS" --knob-angle-sign "$KNOB_ANGLE_SIGN")
+if [[ "$RESOLVED_CONFIRM" == 1 ]]; then
     ARGS+=(--confirm-curation-boundaries)
 fi
 "$PY" "$TOOL_DIR/scripts/generate_custom_code_cache.py" "${ARGS[@]}"
 
-"$PY" - "$CLEAN_ROOT" "$OUT_DIR" "$TOOL_DIR" "$WORK_DIR/input_hashes.json" <<'PY'
+"$PY" - "$DATA_ROOT" "$OUT_DIR" "$TOOL_DIR" "$WORK_DIR/input_hashes.json" "$RESOLVED_CONFIRM" <<'PY'
 from collections import Counter
 import hashlib, io, json, sys, tokenize
 from pathlib import Path
 import torch
-root, out, tool, fingerprints = map(Path, sys.argv[1:])
+root, out, tool, fingerprints = map(Path, sys.argv[1:5])
 sys.path.insert(0, str(tool / "scripts"))
 from rebuild_semantic_code_cache import calls, validate_inputs
 info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
@@ -117,7 +126,8 @@ report = json.loads((out / "code_generation_report.json").read_text(encoding="ut
 validate_inputs(cache, order, records, info)
 counts = Counter(name for row in records for span in row["spans"] for name, _, _ in calls(span["code"]))
 if (report["episodes"] != info["total_episodes"] or report["frames"] != info["total_frames"]
-        or Path(report["dataset_root"]).resolve() != root.resolve() or dict(counts) != report["calls"]):
+        or Path(report["dataset_root"]).resolve() != root.resolve() or dict(counts) != report["calls"]
+        or report["source_context_requested"] != (sys.argv[5] == "1")):
     raise ValueError("生成报告与数据集/缓存不一致")
 for code in cache["codes"]:
     if any(t.type == tokenize.COMMENT for t in tokenize.generate_tokens(io.StringIO(code).readline)):
