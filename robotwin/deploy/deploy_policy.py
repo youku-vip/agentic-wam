@@ -222,7 +222,7 @@ class _CosmosTextEncoder:
                 if b is not None and b.is_meta:
                     mod._buffers[bn] = torch.zeros(b.shape, dtype=torch.float32)
         self.qwen = qwen.to(device, dtype).eval()
-        self.proc = AutoProcessor.from_pretrained("/data/modelRepository/w001/w001_agentic-wam-pretrain-yamego3k-soup-e1/weights/Cosmos-Reason1-7B")
+        self.proc = AutoProcessor.from_pretrained(src)
         self.device = device
         self.max_len = int(max_len)
         # Optional for a policy sharing one GPU with the perception services.
@@ -270,7 +270,7 @@ class AgenticWAMCosmosRobotWinPolicy:
     def __init__(self, model_cfg, processor_cfg, checkpoint_path, dataset_stats_path,
                  device, action_horizon, replan_steps, num_inference_steps, sigma_shift,
                  seed, text_ckpt_dir, text_max_len, n_cameras, num_video_frames,
-                 video_log_dir=None, video_size=None):
+                 video_log_dir=None, video_size=None, text_cache_dir=None, code_prompt_builder=None):
         # The checkpoint supplies every trained weight (dit.*, proprio_encoder.*, code_vision.*); the frozen
         # VAE comes from wan_vae_path. No Cosmos video checkpoint is read at inference.
         mc = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
@@ -292,7 +292,12 @@ class AgenticWAMCosmosRobotWinPolicy:
         self.video_size = validate_video_image_size(video_size, self.processor.shape_meta)
         self.processor.set_normalizer_from_stats(load_dataset_stats_from_json(str(dataset_stats_path)))
 
-        self.text = _CosmosTextEncoder(text_ckpt_dir, device, max_len=text_max_len)
+        self.code_prompt_builder = code_prompt_builder
+        if text_cache_dir is not None:
+            from agenticwam.utils.deployment_text_cache import CachedCosmosTextEncoder
+            self.text = CachedCosmosTextEncoder(text_cache_dir)
+        else:
+            self.text = _CosmosTextEncoder(text_ckpt_dir, device, max_len=text_max_len)
 
         # Use the training video geometry for both final resize and crop.
         image_h, image_w = self.video_size
@@ -488,7 +493,9 @@ class AgenticWAMCosmosRobotWinPolicy:
         # the video/action experts were trained on, and why the embed cache stays small), while the CODE
         # expert gets THIS episode's own instruction. Keep the raw one before the canonical override.
         episode_instruction = instruction
-        instruction = self._canonical_instruction(instruction)
+        custom_prompt_builder = getattr(self, "code_prompt_builder", None)
+        if custom_prompt_builder is None:
+            instruction = self._canonical_instruction(instruction)
         wrapped_instruction = DEFAULT_PROMPT.format(task=instruction)
         # EXP-1: prefix the SAME retrieval skill block the code expert was TRAINED with
         # (dataset skill_prompt_map). Env-gated: unset -> unchanged behaviour.
@@ -496,7 +503,9 @@ class AgenticWAMCosmosRobotWinPolicy:
         # completed-slice history block -- "# Instruction: %s\n# Completed:\n%s# Next:\n"
         # (robot_video_dataset.py::_get_code_slice), NOT the DEFAULT_PROMPT-wrapped form. Sending the
         # wrapped form there would repeat exactly the mismatch that made the code task-blind.
-        if os.environ.get("AGENTICWAM_SKILL_PROMPT_ONLY"):
+        if custom_prompt_builder is not None:
+            code_instruction = custom_prompt_builder(instruction)
+        elif os.environ.get("AGENTICWAM_SKILL_PROMPT_ONLY"):
             # skill_prompt_only=true runs (robot_video_dataset.py:321): the code expert
             # was trained on ONLY the skill block, no instruction appended. Sending the
             # wrapped instruction too would be the same OOD-prompt mismatch as before.
@@ -568,7 +577,8 @@ class AgenticWAMCosmosRobotWinPolicy:
                         _cf.write(_cj.dumps({"replan": int(self.step_count), "code": str(out[1])}) + "\n")
                 except Exception as _ce:
                     logger.warning("codes.jsonl append failed: %s", _ce)
-            if os.environ.get("AGENTICWAM_SLICE_SUMMARY") and len(out) >= 2 and isinstance(out[1], str):
+            if (custom_prompt_builder is None and os.environ.get("AGENTICWAM_SLICE_SUMMARY")
+                    and len(out) >= 2 and isinstance(out[1], str)):
                 # MEMFULL self-history: the slice just generated becomes the next replan's
                 # "Last:" entry and extends the slots-encoder text (model._mem_code_history).
                 _g = out[1].strip()

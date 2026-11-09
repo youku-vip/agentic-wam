@@ -20,6 +20,7 @@ import argparse
 import base64
 import binascii
 import io
+import hashlib
 import json
 import logging
 import os
@@ -63,8 +64,14 @@ def check_state(obj: Any) -> np.ndarray:
 
 
 def check_rotation6d(value: np.ndarray) -> None:
+    value = np.asarray(value, dtype=np.float64)
+    if value.ndim < 1 or value.shape[-1] != 6 or not np.isfinite(value).all():
+        raise ValueError('rotation6D must contain six finite values')
     first, second = value[..., :3], value[..., 3:6]
-    if (np.linalg.norm(first, axis=-1) < 1e-6).any() or (np.linalg.norm(np.cross(first, second), axis=-1) < 1e-6).any():
+    n1, n2 = np.linalg.norm(first, axis=-1), np.linalg.norm(second, axis=-1)
+    if (n1 < 1e-6).any() or (n2 < 1e-6).any():
+        raise ValueError('rotation6D columns must be nonzero and linearly independent')
+    if (np.linalg.norm(np.cross(first/n1[..., None], second/n2[..., None]), axis=-1) < 1e-4).any():
         raise ValueError('rotation6D columns must be nonzero and linearly independent')
 
 
@@ -128,6 +135,85 @@ def train_camera_order(cfg, override: str | None) -> tuple[str, str, str]:
     return order
 
 
+def load_training_config(args):
+    """Load a resolved run snapshot without constructing a dataset or training a model."""
+    from omegaconf import OmegaConf
+    if args.train_config:
+        path = Path(args.train_config).expanduser().resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f'training config missing: {path}')
+        cfg = OmegaConf.load(path)
+        OmegaConf.set_struct(cfg, False)
+        for override in args.override:
+            key, sep, value = override.partition('=')
+            key = key.lstrip('+')
+            if not sep or '.' not in key:
+                raise ValueError('--train-config accepts dotted value overrides, e.g. paths.wan_vae=/path; '
+                                 'Hydra group overrides such as data=custom1 require --task instead')
+            parsed = OmegaConf.from_dotlist([f'value={value}']).value
+            OmegaConf.update(cfg, key, parsed, merge=True, force_add=True)
+    else:
+        if not args.task or not args.dataset:
+            raise ValueError('provide --train-config RUN/config.yaml, or BOTH --task and --dataset')
+        from agenticwam.utils.config_resolvers import register_default_resolvers
+        register_default_resolvers()
+        from hydra import compose, initialize_config_dir
+        from hydra.core.global_hydra import GlobalHydra
+        if GlobalHydra.instance().is_initialized():
+            GlobalHydra.instance().clear()
+        with initialize_config_dir(version_base='1.3', config_dir=str(ROOT / 'configs')):
+            cfg = compose(config_name='train', overrides=[f'task={args.task}',
+                          f'data.dataset_root={args.dataset}'] + args.override)
+        OmegaConf.set_struct(cfg, False)
+    if args.skill_prompt_map:
+        cfg.data.train.skill_prompt_map = args.skill_prompt_map
+    return cfg
+
+
+def select_stats_file(args, cfg) -> Path:
+    """Prefer the exact training run's saved statistics over a mutable dataset file."""
+    if args.dataset_stats:
+        result = Path(args.dataset_stats).expanduser()
+    elif args.train_config and Path(args.train_config).resolve().with_name('dataset_stats.json').is_file():
+        result = Path(args.train_config).resolve().with_name('dataset_stats.json')
+    else:
+        path = cfg.data.train.get('pretrained_norm_stats')
+        if not path:
+            raise ValueError('no normalization snapshot; provide --dataset-stats from this training run')
+        result = Path(str(path)).expanduser()
+    result = result.resolve()
+    if not result.is_file():
+        raise FileNotFoundError(f'training normalization stats missing: {result}')
+    return result
+
+
+def make_code_prompt_builder(train_cfg, default_prompt):
+    """Mirror RobotVideoDataset's ordinary per-instruction prompt composition exactly."""
+    if train_cfg.get('code_slices', False):
+        raise ValueError('history-based code-slice training needs its matching history composer')
+    path = train_cfg.get('skill_prompt_map')
+    skill_map = None
+    if path:
+        with Path(str(path)).expanduser().open(encoding='utf-8') as handle:
+            skill_map = json.load(handle)
+        if not isinstance(skill_map, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+                                                for k, v in skill_map.items()):
+            raise ValueError('skill_prompt_map must map instruction strings to prompt strings')
+    only = bool(train_cfg.get('skill_prompt_only', False))
+    mode = str(train_cfg.get('code_instruction_mode', 'shared'))
+    if mode not in ('shared', 'episode'):
+        raise ValueError(f'unsupported code_instruction_mode={mode}')
+
+    def build(instruction):
+        wrapped = default_prompt.format(task=instruction)
+        if mode == 'episode' or skill_map is None:
+            return wrapped
+        if instruction not in skill_map:
+            raise ValueError(f'instruction is absent from training skill_prompt_map: {instruction!r}')
+        return skill_map[instruction] + ('' if only else wrapped)
+    return build
+
+
 class Custom34Runtime:
     def __init__(self, args):
         if not ROOT.joinpath("robotwin", "deploy", "deploy_policy.py").is_file():
@@ -139,9 +225,6 @@ class Custom34Runtime:
         os.chdir(ROOT)
 
         import torch
-        from hydra import compose, initialize_config_dir
-        from hydra.core.global_hydra import GlobalHydra
-        from omegaconf import OmegaConf
         import deploy_policy as dp
         from agenticwam.datasets.lerobot.transforms.custom_unified_eef import (
             CustomUnifiedEEFTransform,
@@ -150,12 +233,7 @@ class Custom34Runtime:
 
         if args.device.startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(f"CUDA unavailable but requested {args.device}")
-        if GlobalHydra.instance().is_initialized():
-            GlobalHydra.instance().clear()
-        with initialize_config_dir(version_base="1.3", config_dir=str(ROOT / "configs")):
-            cfg = compose(config_name="train", overrides=[f"task={args.task}",
-                    f"data.dataset_root={args.dataset}"] + args.override)
-        OmegaConf.set_struct(cfg, False)
+        cfg = load_training_config(args)
         self.cfg = cfg
         self.cam_order = train_camera_order(cfg, args.camera_order)
 
@@ -186,9 +264,28 @@ class Custom34Runtime:
         if not any(t.endswith("custom_unified_eef.CustomUnifiedEEFTransform") for t in targets):
             raise ValueError(f"training config does not use CustomUnifiedEEFTransform: {targets}")
 
-        self.stats_file = str(args.dataset_stats or cfg.data.train.pretrained_norm_stats)
-        if not Path(self.stats_file).is_file():
-            raise FileNotFoundError(f"training normalization stats missing: {self.stats_file}")
+        self.stats_file = str(select_stats_file(args, cfg))
+        self.stats_sha256 = hashlib.sha256(Path(self.stats_file).read_bytes()).hexdigest()
+        self.checkpoint = str(ckpt)
+        self.video_size = list(video_size)
+        self.image_resize_mode = train_resize_mode
+        self.image_letterbox_scale_up = bool(cfg.data.train.processor.get('image_letterbox_scale_up', True))
+        code_prompt_builder = make_code_prompt_builder(cfg.data.train, dp.DEFAULT_PROMPT)
+        conflicting = [name for name in ('AGENTICWAM_CODE_PREAMBLE_FILE', 'AGENTICWAM_ORACLE_CODE_FILE')
+                       if os.environ.get(name)]
+        if os.environ.get('AGENTICWAM_CODE_NO_INSTRUCTION', '0') == '1':
+            conflicting.append('AGENTICWAM_CODE_NO_INSTRUCTION')
+        if conflicting:
+            raise ValueError(f'custom config prompt would be overridden; unset these legacy variables: {conflicting}')
+        text_cache_dir = args.text_cache_dir or cfg.data.train.get('cosmos_text_cache_dir')
+        if args.text_mode == 'encoder':
+            text_cache_dir = None
+        elif not text_cache_dir or not Path(str(text_cache_dir)).expanduser().is_dir():
+            raise FileNotFoundError('Cosmos text cache missing: set --text-cache-dir to the training cache; '
+                                    'or explicitly use --text-mode encoder with paths.text_encoder weights')
+        if text_cache_dir:
+            text_cache_dir = str(Path(str(text_cache_dir)).expanduser().resolve())
+        self.text_mode = 'cache' if text_cache_dir else 'encoder'
         nf = int(cfg.data.train.num_frames)
         self.horizon = int(args.action_horizon or (nf - 1))
         if self.horizon != nf - 1:
@@ -206,6 +303,7 @@ class Custom34Runtime:
             num_inference_steps=args.num_inference_steps, sigma_shift=None,
             seed=None, text_ckpt_dir=str(cfg.paths.text_encoder), text_max_len=128,
             n_cameras=3, num_video_frames=n_v, video_size=video_size,
+            text_cache_dir=text_cache_dir, code_prompt_builder=code_prompt_builder,
         )
         transforms = self.policy.processor.action_state_transforms
         custom = [t for t in transforms if isinstance(t, CustomUnifiedEEFTransform)]
@@ -232,10 +330,12 @@ class Custom34Runtime:
         self.server_id = uuid.uuid4().hex
         self._instruction = None
         self.code_objective = str(cfg.model.get('code_objective', 'joint'))
-        self.history_modes = [name for name in ('AGENTICWAM_SLICE_MODE', 'AGENTICWAM_SLICE_SUMMARY') if os.environ.get(name)]
+        self.history_modes = []  # Ordinary custom training uses the current instruction/observation.
         self.policy.reset()
         LOG.info("READY: 34D raw state -> 64D normalized proprio; 64D delta -> 20D absolute EEF")
         LOG.info("camera order %s; chunk=%d; RTC server support=%s", self.cam_order, self.horizon, self.rtc_enabled)
+        LOG.info('image=%s resize=%s scale_up=%s text=%s stats_sha256=%s', self.video_size,
+                 self.image_resize_mode, self.image_letterbox_scale_up, self.text_mode, self.stats_sha256)
         LOG.info('instance=%s code_objective=%s fast_joint=%s code_memory=%s history_modes=%s',
                  self.server_id, self.code_objective, self.fast_joint,
                  bool(getattr(self.policy.model, 'code_memory_enabled', False)), self.history_modes)
@@ -356,6 +456,9 @@ class Custom34Runtime:
                         path.write_text(str(code) if code is not None else "", encoding="utf-8")
                     except OSError as exc:
                         LOG.warning('Code log write failed after successful inference: %s', exc)
+            except Exception:
+                self._reset_episode_unlocked()
+                raise
             finally:
                 # RTC staging must NEVER leak into later requests.
                 self.policy.model._rtc_targets = None
@@ -376,9 +479,13 @@ class InferenceServer(ThreadingHTTPServer):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--task", required=True, help="Hydra training task name, e.g. posttrain_custom")
-    ap.add_argument("--dataset", required=True, help="same dataset root as training")
+    ap.add_argument('--train-config', help='resolved config.yaml saved in the training run (recommended)')
+    ap.add_argument("--task", help="legacy Hydra training task name, e.g. posttrain_custom")
+    ap.add_argument("--dataset", help="legacy dataset root, used together with --task")
     ap.add_argument("--dataset-stats", default=None)
+    ap.add_argument('--skill-prompt-map', help='relocated copy of the EXACT training skill_prompt_map JSON')
+    ap.add_argument('--text-cache-dir', help='relocated training Cosmos prompt-embedding cache')
+    ap.add_argument('--text-mode', choices=('cache', 'encoder'), default='cache')
     ap.add_argument("--override", action="append", default=[], help="repeat for Hydra overrides")
     ap.add_argument("--camera-order", default=None, help="exact training camera order: head,left,right")
     ap.add_argument("--action-horizon", type=int, default=None)
@@ -393,6 +500,10 @@ def main():
     ap.add_argument("--max-body-mb", type=int, default=24)
     ap.add_argument("--max-wait-sec", type=float, default=5.0)
     args = ap.parse_args()
+    if args.replan_steps < 1 or args.num_inference_steps < 1 or args.max_wait_sec < 0 or args.max_body_mb < 1:
+        ap.error('replan/inference steps and max-body-mb must be positive; max-wait-sec must be nonnegative')
+    if args.train_config and (args.task or args.dataset):
+        ap.error('--train-config already contains task/data; use dotted --override values to relocate paths')
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     # No API authentication; default bind is loopback only.
     if args.host not in ("127.0.0.1", "localhost", "::1"):
@@ -403,12 +514,15 @@ def main():
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        server_version = "AgenticWAM-Custom34/1"
+        server_version = "AgenticWAM-Custom34/2"
 
         def log_message(self, fmt: str, *values):
             LOG.info("%s %s", self.address_string(), fmt % values)
 
         def send_json(self, status: int, payload: dict):
+            request_id = getattr(self, '_request_id', None)
+            if request_id is not None:
+                payload = dict(payload, request_id=request_id)
             raw = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -429,12 +543,18 @@ def main():
             obj = json.loads(self.rfile.read(int(length)))
             if not isinstance(obj, dict):
                 raise ValueError("JSON body must be an object")
+            request_id = obj.get('request_id')
+            if request_id is not None and (not isinstance(request_id, str) or not 1 <= len(request_id) <= 128):
+                raise ValueError('request_id must be a string of 1..128 characters')
+            self._request_id = request_id
             return obj
 
         def do_GET(self):
             if self.path != "/health":
                 return self.send_error_response(404, "GET /health only")
             self.send_json(200, {"status": "success", "state_dim": 34,
+                                 'protocol_version': 2, 'action_type': 'absolute_eef20',
+                                 'rotation6d': 'first_two_columns', 'gripper_open_value': 1,
                                  "input_camera_order": rt.cam_order, "model_dim": 64,
                                  "action_dim": 20, "chunk_size": rt.horizon,
                                  "calls": rt.calls, "rtc_enabled": rt.rtc_enabled,
@@ -442,15 +562,22 @@ def main():
                                  "episode_count": rt.policy.episode_count,
                                  "code_objective": rt.code_objective, "fast_joint": rt.fast_joint,
                                  "code_memory": bool(getattr(rt.policy.model, 'code_memory_enabled', False)),
-                                 "history_modes": rt.history_modes})
+                                 "history_modes": rt.history_modes,
+                                 'video_size': getattr(rt, 'video_size', None),
+                                 'image_resize_mode': getattr(rt, 'image_resize_mode', None),
+                                 'image_letterbox_scale_up': getattr(rt, 'image_letterbox_scale_up', None),
+                                 'stats_sha256': getattr(rt, 'stats_sha256', None),
+                                 'text_mode': getattr(rt, 'text_mode', None)})
 
         def do_POST(self):
             t0 = time.perf_counter()
+            self._request_id = None
             if self.path not in ("/act", "/reset"):
                 return self.send_error_response(404, "POST /act or /reset only")
             try:
                 body = self.read_body()
             except (ValueError, json.JSONDecodeError) as exc:
+                self.close_connection = True
                 return self.send_error_response(400, str(exc), 1000*(time.perf_counter()-t0))
             if not gate.acquire(timeout=args.max_wait_sec):
                 return self.send_error_response(503, "GPU busy", 1000*(time.perf_counter()-t0))

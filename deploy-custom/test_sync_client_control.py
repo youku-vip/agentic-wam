@@ -13,18 +13,20 @@ class Logger:
     def __getattr__(self,name):return lambda *args,**kwargs:None
 
 
-def execute(*,steps=40,stale_grip=False,done_every=False,switch_and_fail=False,pause_same_prompt=False,pause_replay=False):
+def execute(*,steps=40,stale_grip=False,done_every=False,switch_and_fail=False,pause_same_prompt=False,pause_replay=False,
+            auto_recovery=False, repeat_prompt=False, infer_fail_at=None):
     tree=ast.parse(SOURCE.read_text())
     main=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='main')
     selected=[n for n in main.body if isinstance(n,(ast.ClassDef,ast.AsyncFunctionDef))
               and n.name in ['GripperStateStabilizer','run_loop_sync']]
-    shared=SimpleNamespace(value='task1',pauses=2)
+    shared=SimpleNamespace(value='task1',pauses=2,revision=0)
     def prompt():
         if pause_same_prompt and env.primary==5 and shared.pauses:
             shared.pauses-=1
             return ''
         return shared.value
     shared.get=prompt
+    shared.snapshot=lambda: (prompt(),shared.revision)
     class Env:
         def __init__(self):self.commands=[];self.primary=0;self.resets=0;self.obs_reads=0
         def observation(self,fresh=False):
@@ -40,6 +42,7 @@ def execute(*,steps=40,stale_grip=False,done_every=False,switch_and_fail=False,p
             if cmd['ee_pos_quat'][0] in (1,2,3,4):
                 self.primary+=1
                 if switch_and_fail and self.primary==20:shared.value='task2'
+                if repeat_prompt and self.primary==5:shared.revision+=1
             return self.observation(fresh=True),0,done_every,False,{}
     env=Env()
     class Client:
@@ -50,6 +53,7 @@ def execute(*,steps=40,stale_grip=False,done_every=False,switch_and_fail=False,p
         async def reset_episode(self):self.resets+=1
         async def guided_inference(self,obs,**kwargs):
             self.calls+=1
+            if self.calls==infer_fail_at:raise ConnectionError('temporary inference failure')
             a=np.zeros((32,20));a[:,0]=self.calls;a[:,18:20]=1
             if pause_same_prompt and self.calls==1:a[1:,18:20]=0
             return dict(action=a)
@@ -69,6 +73,7 @@ def execute(*,steps=40,stale_grip=False,done_every=False,switch_and_fail=False,p
                    time=__import__('time'),logger=Logger(),env=env,rtc=rtc,shared_prompt=shared,
                    replay_ctrl=SimpleNamespace(is_replaying=replaying),
                    get_obs_with_retry=get_obs,trans_utils=SimpleNamespace(rot6d_to_euler_angle=lambda _:np.zeros(3)),
+                   auto_gripper_recovery=auto_recovery,gripper_lock_steps=0,
                    cfg=SimpleNamespace(env=SimpleNamespace(num_steps=steps,max_hz=0)))
     exec(compile(ast.Module(body=selected,type_ignores=[]),str(SOURCE),'exec'),namespace)
     asyncio.run(asyncio.wait_for(namespace['run_loop_sync'](),timeout=2))
@@ -95,7 +100,7 @@ def test_done_counts_consumed_action_and_resets_remote_episode():
 
 
 def test_task_switch_refreshes_recovery_anchor():
-    env,rtc=execute(steps=40,switch_and_fail=True)
+    env,rtc=execute(steps=40,switch_and_fail=True,auto_recovery=True)
     assert rtc.calls==2 and rtc.resets==1
     assert env.commands[-1]['gripper_positions']==['open','open']
     assert np.all(env.commands[-1]['ee_pos_quat']==20) # second episode, not lifetime-first pose 10
@@ -113,3 +118,21 @@ def test_sync_checks_replay_between_commands():
     assert rtc.resets==1 and rtc.calls==3
     assert [c['ee_pos_quat'][0] for c in env.commands[:5]]==[1]*5
     assert env.commands[5]['ee_pos_quat'][0]==2
+
+
+def test_repeated_same_prompt_restarts_and_aborts_old_chunk():
+    env,rtc=execute(repeat_prompt=True)
+    assert rtc.resets==1 and rtc.calls==3
+    assert [c['ee_pos_quat'][0] for c in env.commands[:5]]==[1]*5
+    assert env.commands[5]['ee_pos_quat'][0]==2
+
+
+def test_no_automatic_recovery_when_feedback_is_closed():
+    env,rtc=execute(steps=40,switch_and_fail=True)
+    assert len(env.commands)==40 and env.commands[-1]['ee_pos_quat'][0]==2
+
+
+def test_failed_inference_fetches_fresh_observation_and_sends_no_command():
+    env,rtc=execute(infer_fail_at=2)
+    assert rtc.calls==3 and env.obs_reads==3 and len(env.commands)==40
+    assert [c['ee_pos_quat'][0] for c in env.commands]==[1]*20+[3]*20

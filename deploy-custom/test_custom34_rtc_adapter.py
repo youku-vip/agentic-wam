@@ -30,7 +30,8 @@ trans_utils=DummyTrans()
 
 SRC=Path(__file__).with_name('rtc_client_agenticwam.py').read_text()
 tree=ast.parse(SRC)
-names={'normalize_http_base_url','convert_obs','encode_png_b64','make_zero_observation','RTCClient'}
+names={'normalize_http_base_url','convert_obs','encode_png_b64','make_zero_observation','RTCClient',
+       'validate_rot6d', 'deployment_control_options', 'SharedPrompt'}
 keep=[node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)) and node.name in names]
 exec(compile(ast.Module(body=keep,type_ignores=[]),'adapter','exec'),globals())
 
@@ -56,7 +57,7 @@ class FakeServer(BaseHTTPRequestHandler):
             self.resp(200,{'status':'success','message':'reset','action':None,'latency':1})
             return
         assert self.path=='/act',self.path
-        assert set(data)=={'instruction','state','images'} or set(data)=={'instruction','state','images','committed','freeze'}
+        assert set(data)=={'instruction','state','images','request_id'} or set(data)=={'instruction','state','images','request_id','committed','freeze'}
         assert len(data['state'])==34
         assert set(data['images'])=={'head','left','right'}
         for k,v in data['images'].items():

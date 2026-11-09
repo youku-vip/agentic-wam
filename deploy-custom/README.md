@@ -1,114 +1,144 @@
-# RealMan RTC Client ↔ Agentic-WAM Custom34 无认证 HTTP 服务端
+# Custom34 服务端与客户端部署 v3
 
-## 兼容范围
+适用于本项目的双臂夹爪自定义数据：raw state34 → unified EEF64 → 模型相对动作64 → absolute EEF action20。原始、清洗后的数据都通过对应训练 run 的配置和统计值部署。代码基于本次上传的旧服务端和 RealMan/ZMQ 客户端修改。
 
-- 基于上传的原始 `rtc_client_agenticwam.py` 修改，保留 RealManGym、RealMan 机械臂执行、IKSolver、FastAPI `/prompt`/`/replay`、夹爪稳定器、异常重推理等控制逻辑。
-- 兼容本包 `custom34_server.py`（即此前的无 Token 自定义双臂服务端），**不是**原 OpenWAM WebSocket 推理服务，也不是官方 YAM 14D 关节服务。
-- 输入：`instruction` 字符串、**完整 34D** 原始状态、`head/left/right` RGB uint8，经 PNG/base64 封装后 HTTP `POST /act`。
-- 输出：服务器 `status/action/latency/message`，客户端解析为 `np.ndarray [H,20] float32` 绝对 EEF 目标。服务端内部执行 34→64 状态、Flow Matching 推理、64D delta→20D absolute 变换；客户端只做实际机器人观测/指令映射。
-- RTC：服务端推理期 rectified-flow inpainting，客户端按**观测时刻**截取旧动作，在 `/act` 发送 `committed=[K,20]` 和 `freeze=L`；带 K−L 软引导尾段。推理返回后跳过已经过时的动作索引；过期/冻结不足时丢弃新区块，不强制切换。无需更改训练。
+默认同步推理，RTC 关闭；夹爪按模型动作执行（>0.5 为 open，否则 close）。默认无 15 步锁爪、无闭合度低于 50 后自动开爪回位。客户端传原始 RGB 图像，服务端按训练 processor 的尺寸和模式处理；256×448 letterbox 的 checkpoint 会继续使用该设置。部署不修改训练配置。
 
-## 安装（两台计算机）
+## 1. GPU 服务端安装
 
-GPU 服务器：
-
-```bash
-cp custom34_server.py /data/algorithm/agentic-wam/deploy/custom34_server.py
-# 训练时的 CustomUnifiedEEFTransform 仍需位于
-# src/agenticwam/datasets/lerobot/transforms/custom_unified_eef.py
-```
-
-机器人客户端：
-
-```bash
-cp /path/to/robot_project/rtc_client_agenticwam.py /path/to/robot_project/rtc_client_agenticwam.py.bak
-cp rtc_client_agenticwam.py /path/to/robot_project/rtc_client_agenticwam.py
-```
-
-机器人端 Python 依赖保持旧项目的 `environment/`、`kinematics_tools/`、`trans_tools/`、`config_tools/`、FastAPI、Draccus 等不变。**推理通信不再依赖 `websockets`**，使用标准库 HTTP；PNG 编码仍依赖 Pillow。建议两端尽量保持环境和 checkpoint 一致。
-
-## 服务端启动（真 RTC）
+保留现有训练环境及模型依赖。此包没有模型权重、训练数据或技能 JSON。
 
 ```bash
 cd /data/algorithm/agentic-wam
-export AGENTICWAM_DEPLOY_DTYPE=bf16
-export AGENTICWAM_EVAL_PREPROC=auto
-export AGENTICWAM_CODE_PIN=0
-CUDA_VISIBLE_DEVICES=0 python deploy/custom34_server.py \
-  --ckpt /真实路径/step_003500.pt \
-  --task posttrain_custom \
-  --dataset /data/datasets/air_fryer_wam/wam/air_fryer_all_0813_0827_1087_v30 \
-  --num-inference-steps 10 \
-  --fast-joint --rtc \
-  --code-log-dir /tmp/agenticwam_custom_codes \
-  --host 127.0.0.1 --port 8765
+PY=/usr/local/bin/python3.11
+PKG="$PWD/custom34-deployment-v3"
+curl -fL 'https://github.com/youku-vip/agentic-wam/raw/refs/heads/codex/custom-data-review-files/deliveries/custom34-deployment-v3.zip' -o /tmp/custom34-deployment-v3.zip
+"$PY" -m zipfile -e /tmp/custom34-deployment-v3.zip "$PKG"
+"$PY" "$PKG/deploy-custom/install_custom34_deployment.py" --server-root "$PWD"
 ```
 
-若 checkpoint 采用 `image_resize_mode: letterbox` 训练，改用 `export AGENTICWAM_EVAL_PREPROC=auto`，并保持训练/验证 processor 配置与对应训练一致。服务端会调用共享的等比例缩放补边变换。安装和回退见 [图像比例修复](../docs/CUSTOM_IMAGE_LETTERBOX.md)。
+安装器检查压缩包文件哈希，先备份全部将替换的文件，再安装六个服务端文件。备份清单路径会打印为 `BACKUP .../manifest.json`。它不覆盖 YAML、train.sh、数据或模型文件。
 
-`256×448` 训练与部署的完整切换命令见 [256×448 图像适配](../docs/CUSTOM_IMAGE_256X448.md)。客户端继续上传原始 `240×424` 图像，服务端按训练配置补边。
+## 2. GPU 服务端启动
 
-上例在 GPU 本机测试。若机器人在另外一台可信内网机器，服务器需通过受保护的端口/SSH 隧道可达；直接监听 `0.0.0.0` 时必须在防火墙限制客户端源地址，不能无认证暴露公网。**没有 Token 或 Authorization 要求**。
-
-按你的实际训练任务名、checkpoint、stats 和 `model.infer_code_tokens` 设置启动参数。每次 `POST /act` 时服务端打印完整 POLICY CODE，并按 `--code-log-dir` 写文件。
-
-## 客户端 Draccus 配置
-
-在你现有配置中，至少修改：
-
-```yaml
-# cfg.env（原本 ws:// 的 WebSocket 地址改为 HTTP）
-post_url: "http://GPU服务器IP:8765"
-infermode: rot6d
-# max_hz: 使用你实际控制/训练适配的频率（不要机械地改为30或10）
-
-# cfg.rtc
-H: 32                # 必须等于服务端 /health 的 chunk_size，通常训练 num_frames-1
-s_min: 16            # 重新规划触发步；应按真实端到端延迟与控制频率选择
-action_dim: 20
-use_rtc: true
-async_mode: true
-```
-
-启动时客户端会先 `GET /health` 校验 `state_dim=34, model_dim=64, action_dim=20, chunk_size=H`，同时确认 server `rtc_enabled=true`；再 `POST /reset`。若参数不一致会**报错退出**，而不是错误控制机器人。
-
-推荐分阶段验证：
-
-1. **通信/输出检查**：客户端 `use_rtc: false, async_mode: false`；服务端可暂不加 `--fast-joint --rtc`。先做非执行/dry-run，确认输入三相机、34D 状态和 20D 动作的所有坐标/夹爪约定。
-2. **异步 RTC**：服务端 `--fast-joint --rtc`，客户端 `use_rtc: true, async_mode: true`。先不连接机械臂，用离线观测/模拟控制验证动作分块连续性。
-3. **真机小范围验证**：控制器自己负责坐标系、限位、速度/加速度/碰撞约束和故障保持。仅在验证后开启实际运动。
-
-## RTC 时序及预算
-
-- 新 Chunk 的第 0 行对应**采集新观测时刻**。客户端记录该时刻旧 Chunk 的游标 `s`，发送旧动作 `A_cur[s:s+K]`，其中前 `L` 帧硬冻结、后面的 `K-L` 帧权重衰减。此时 `K<=24`，`L<=K`。
-- `L` 来自最近测得的端到端推理延迟（单位动作步）及可配置余量；`K` 额外保留软引导过渡段。参数可用 `AGENTICWAM_RTC_FREEZE_MARGIN=2`、`AGENTICWAM_RTC_SOFT_ROWS=6` 修改。
-- 返回时若控制执行已前进 `d` 帧，从新 Chunk 的 **第 d 行**继续执行，不重复播放新 Chunk 的前 d 行。如果 `d` 超出预测冻结区或已经超过整块长度，会拒绝切换并保持旧块末端目标，等待更可靠的新观测。
-- **硬件限制**：当前按一次 `env.step` 对应一个 Action 行、以整数游标近似对齐。没有真实机器人动作执行时间戳/相机采集时间戳，无法保证亚帧对齐。上机前必须测量执行频率、采集延迟、推理 RTT 和控制器真实跟踪误差。
-- 若 H=32、s_min=16、30Hz，则从重规划触发到旧动作块耗尽仅剩约 `16/30=0.53s`，推理 RTT 超过它就不能持续不间断执行。降低推理延迟、提早触发重规划或经验证后调整控制频率；**不能靠 RTC 开关解决算力延迟**。
-- 丢弃的过期 Chunk 不会自动提高成功率；在网络/模型持续慢于控制需求时，机器人会保持最后一个目标点。请确认你的底层执行器具备真正的超时保持及安全停止能力。
-
-## 本次同步修改
-
-- 去掉 WebSocket `ping/reset/obs` 协议；HTTP `GET /health`、`POST /reset`、`POST /act`。
-- 发送**完整** raw 34D（原代码只发 `state[14:34]` 20D）。
-- 三路图像键改为 `head/left/right`；PNG/base64 与原来一致。
-- 响应读取二维 `action`，**不**额外 `unsqueeze`。
-- `H` 默认 32、`action_dim` 默认 20，服务端校验不匹配就停止。
-- `asyncio.to_thread` 承担 PNG 压缩和 HTTP I/O，避免阻塞执行协程。超时不盲目重发 `/act`，避免模型 episode/code state 被重复推进。
-- 客户端任务切换时停止旧动作，并 `POST /reset` 清空服务端每 Episode 的代码上下文。
-- 重新采样以最新观测为基准，避免重复使用旧图像；异常重新推理依然保持并阻塞等待（加超时）。
-- 原客户端每次请求都保存三张 JPG 的行为改为默认关闭，必要时设置 `AGENTICWAM_SAVE_OBS=1`。
-- 客户端原有无鉴权 FastAPI 控制端默认绑定 `127.0.0.1:8300`（如确需外部调用，用 `PROMPT_SERVER_HOST` 显式配置并隔离网络）。
-
-## 无设备测试
-
-需要 `numpy` 和 `Pillow`：
+`RUN_DIR` 指向此次要部署的训练 run；`CKPT` 必须选该 run 实际保存的 weights 文件。下面用已讨论的 run 和 step_004000 举例，换成你要评测的 checkpoint。
 
 ```bash
-python test_custom34_rtc_adapter.py
-python -m py_compile rtc_client_agenticwam.py
+cd /data/algorithm/agentic-wam
+PY=/usr/local/bin/python3.11
+RUN_DIR="$PWD/runs/air_fryer_zero2_10000_p012_v4_1"
+CKPT="$RUN_DIR/checkpoints/weights/step_004000.pt"
+export AGENTICWAM_DEPLOY_DTYPE=bf16
+export AGENTICWAM_EVAL_PREPROC=auto
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/src" "$PY" deploy-custom/custom34_server.py \
+  --train-config "$RUN_DIR/config.yaml" \
+  --ckpt "$CKPT" \
+  --device cuda:0 \
+  --num-inference-steps 10 \
+  --code-log-dir ./custom34_code_logs \
+  --host 0.0.0.0 --port 8765
 ```
 
-测试采用模拟 HTTP 服务端，验证 `GET /health`、`POST /reset`、`POST /act`、状态34、RGB PNG、动作 `[32,20]`、RTC `committed/freeze` 和观测时刻对齐以及 horizon 不一致时拒绝连接。另可将 `validate_custom34_bridge.py` 放到 Agentic-WAM 的 `deploy/` 下测试 SE(3) 变换。
+默认不加 `--fast-joint`、`--rtc`，先使用同步模式。一个服务端实例配一个客户端，不要让多个机器人或负载均衡副本共用 episode 状态。
 
-**目前仅完成语法和无设备 HTTP 模拟测试；尚未使用你的 GPU Checkpoint、真实相机、`trans_utils` Rotation6D 实现或 RealMan 硬件做集成测试。必须检查 Rotation6D 是旋转矩阵前两列的格式，以及绝对 EEF 单位、参考坐标系、夹爪语义与训练一致。**
+配置与归一化读取顺序：
+
+- `--train-config` 直接读取训练 run 保存的已解析配置，不要求当前仓库还有 posttrain_custom1/custom1 分组文件。
+- 统计值优先使用显式 `--dataset-stats`，其次是 config.yaml 同目录的 dataset_stats.json，再次是配置中的 train.pretrained_norm_stats。必须与 checkpoint 配套。
+- 技能提示词读取 train.skill_prompt_map 指定的 JSON，按当前 instruction 查找；完全复用训练的 skill_prompt_only/code_instruction_mode。不会临时加入训练没见过的新 API 说明。
+- 文本嵌入默认复用 train.cosmos_text_cache_dir，按训练时包裹后的完整提示词计算 SHA256 查找。四种任务的英文指令须与训练一致。找不到缓存时报错，不替换为其他任务。
+- 如果迁移过文件，可追加 `--dataset-stats /新的/统计.json`、`--skill-prompt-map /新的/skill_prompt_by_instruction.json`、`--text-cache-dir /新的/cosmos_text_embeds_cache`。这些应是训练文件的原样副本。
+- 如果需要新任务文本，可预计算对应嵌入，或显式使用 `--text-mode encoder --override paths.text_encoder=/完整/Cosmos-Reason1-7B`，后者另加载文本模型，显存开销明显增加。
+- 其他权重迁移用重复的点路径参数，例如 `--override paths.code_model=/新路径/SDAR-1.7B-Chat`。已解析配置内部的 model.xxx 路径也可能需要同步改；以保存的配置实际字段为准。
+
+旧的 `--task posttrain_custom --dataset /训练数据根目录 --override data=custom` 方式仍保留，但必须有对应 Hydra 配置文件。使用 --train-config 时不混用 --task/--dataset。
+
+查看服务状态：
+
+```bash
+curl -f http://127.0.0.1:8765/health
+```
+
+检查 state_dim=34、action_dim=20、chunk_size=32、action_type=absolute_eef20；对于相应训练配置还应看到 video_size=[256,448]、image_resize_mode=letterbox，以及统计文件 stats_sha256。
+
+## 3. 机器人客户端安装
+
+在能执行原来 `python -m environment.rtc_client_agenticwam` 的机器人项目目录操作。仍使用原有的 config_tools、RealManGym、trans_tools、IKSolver、Draccus 环境；不要在 GPU 项目目录创建另一套机器人接口。
+
+```bash
+PY=/usr/local/bin/python3.11
+PKG=/tmp/custom34-deployment-v3
+curl -fL 'https://github.com/youku-vip/agentic-wam/raw/refs/heads/codex/custom-data-review-files/deliveries/custom34-deployment-v3.zip' -o /tmp/custom34-deployment-v3.zip
+"$PY" -m zipfile -e /tmp/custom34-deployment-v3.zip "$PKG"
+"$PY" "$PKG/deploy-custom/install_custom34_deployment.py" --client-auto
+```
+
+安装器只查找模块路径，不导入机器人模块。找不到时改用 `--client-root /包含environment目录的机器人项目`，或者 `--client-file /实际路径/environment/rtc_client_agenticwam.py`。客户端也先备份再替换。
+
+只读检查 SDK 的旋转约定，不连接或控制机械臂：
+
+```bash
+"$PY" "$PKG/deploy-custom/check_client_rotation.py"
+```
+
+该检查比较多个非零姿态，报告角度单位、Euler 顺序、6D 行/列编码及 SDK 正反转换误差。项目的训练转换假设 6D 为旋转矩阵的前两列。客户端保留你原来的 SDK 正反转换；若检查未确认 first_two_columns_verified=true，请提供输出与 trans_utils 两个转换函数核对，不要直接转置已训练模型的数据。
+
+## 4. 机器人客户端启动（同步，RTC 关闭）
+
+保留原来的启动目录，将 SERVER_URL 改成 GPU 服务的实际可达地址。
+
+```bash
+PY=/usr/local/bin/python3.11
+SERVER_URL='http://GPU服务器IP:8765'
+export AGENTICWAM_AUTO_GRIPPER_RECOVERY=0
+export AGENTICWAM_GRIPPER_LOCK_STEPS=0
+export AGENTICWAM_SAVE_OBS=0
+export AGENTICWAM_HTTP_TIMEOUT=120
+"$PY" -m environment.rtc_client_agenticwam \
+  --config_path=/data/code/common-tools/config_tools/config_dir/main_config.yaml \
+  --robots.e16.urdf_path=/data/code/wheelrobot3_ros1/src/dual_arm_robot/wheelbot_description/urdf/wheelbot.urdf \
+  --choice=zmq --which_robot=e16 \
+  --env.post_url="$SERVER_URL" \
+  --env.num_steps=20000 --rtc.s_min=20 \
+  --env.im_w=424 --env.im_h=240 \
+  --env.obs=robot --env.action_which=both --env.debug=False \
+  --env.infermode=rot6d \
+  --rtc.prompt="The right gripper picks up the pink cake and puts it into the air fryer." \
+  --rtc.async_mode=false --rtc.use_rtc=false \
+  --rtc.beta=10.0 --rtc.action_dim=20 --env.max_hz=10 --rtc.H=32
+```
+
+客户端 H 必须等于服务端 chunk_size；10 Hz 应与此数据的采样/执行约定一致。同步模式是采集新观测 → 推理等待 → 执行前 s_min 行 → 重新采集；推理等待期间不会额外发开爪指令。
+
+如需要恢复旧行为，只在客户端显式设置：
+
+```bash
+export AGENTICWAM_AUTO_GRIPPER_RECOVERY=1
+export AGENTICWAM_GRIPPER_LOCK_STEPS=15
+```
+
+两个开关独立：前者启用旧的闭合度低于 50 后开爪、返回本次任务初始姿态的恢复逻辑；后者启用夹爪切换后的锁定步数。默认都关闭。
+
+## 5. 新任务、暂停与异常
+
+客户端原有 8300 端口任务接口保留。每次 POST /prompt 都表示开始新任务，即使文本完全相同：停止旧 chunk、清空服务端 episode/code 状态、采集新观测重新规划。DELETE /prompt 暂停发动作。
+
+```bash
+curl -f -X POST http://127.0.0.1:8300/prompt \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"The left gripper opens the air fryer."}'
+curl -f -X DELETE http://127.0.0.1:8300/prompt
+```
+
+服务端每次 /act 都打印生成代码，代码只用于模型条件和审阅，客户端执行的是返回的数值 action20，不通过 exec 执行生成的 Python。网络失败、形状错误、无效 6D 或响应 request_id 不匹配时，该请求不返回可执行动作；同步循环等待后重新采集。服务端实例 ID 变化时丢弃动作，重新握手和 reset，不继续使用旧 episode。
+
+## 6. 回退与验证范围
+
+使用安装时打印的实际备份清单路径回退：
+
+```bash
+"$PY" "$PKG/deploy-custom/install_custom34_deployment.py" \
+  --undo /实际备份路径/manifest.json
+```
+
+回退前会检查安装后文件是否又被编辑；有后续编辑时拒绝覆盖。测试结果和运行命令见压缩包内 deploy-custom/DEPLOYMENT_V3_TESTING.md。已测试 CPU 转换、模拟 HTTP 和同步控制循环、配置/提示词与图像处理一致性；未在此环境加载你的 checkpoint、运行 CUDA 或连接机器人，不能据此保证实机抓取成功率。

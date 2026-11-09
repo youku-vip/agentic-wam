@@ -50,10 +50,10 @@ def normalize_http_base_url(uri: str) -> str:
         raise ValueError('Expected an HTTP(S) server URL with a hostname')
     _ = parsed.port  # Validate optional port; standard 80/443 need not be explicit.
     if parsed.path not in ("", "/", "/act"):
-        logger.warning("[HTTP] ignoring old WebSocket path %s; HTTP server uses /act", parsed.path)
+        logger.warning("[HTTP] ignoring old WebSocket path {}; HTTP server uses /act", parsed.path)
     base = f"{scheme}://{parsed.netloc}"
     if scheme != parsed.scheme:
-        logger.warning("[HTTP] converted %s:// URL into %s:// for custom34 server", parsed.scheme, scheme)
+        logger.warning("[HTTP] converted {}:// URL into {}:// for custom34 server", parsed.scheme, scheme)
     return base
 
 
@@ -67,6 +67,28 @@ def encode_png_b64(img: np.ndarray) -> str:
     buf = io.BytesIO()
     Image.fromarray(img).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def validate_rot6d(value):
+    value = np.asarray(value, dtype=np.float64)
+    if value.ndim < 1 or value.shape[-1] != 6 or not np.isfinite(value).all():
+        raise ValueError('rotation6D must contain six finite values')
+    first, second = value[..., :3], value[..., 3:]
+    n1, n2 = np.linalg.norm(first, axis=-1), np.linalg.norm(second, axis=-1)
+    if (n1 < 1e-6).any() or (n2 < 1e-6).any():
+        raise ValueError('rotation6D columns must be nonzero and linearly independent')
+    if (np.linalg.norm(np.cross(first/n1[..., None], second/n2[..., None]), axis=-1) < 1e-4).any():
+        raise ValueError('rotation6D columns must be nonzero and linearly independent')
+
+
+def deployment_control_options():
+    recovery = os.environ.get('AGENTICWAM_AUTO_GRIPPER_RECOVERY', '0').lower()
+    if recovery not in ('0', '1', 'false', 'true'):
+        raise ValueError('AGENTICWAM_AUTO_GRIPPER_RECOVERY must be 0 or 1')
+    lock_steps = int(os.environ.get('AGENTICWAM_GRIPPER_LOCK_STEPS', '0'))
+    if lock_steps < 0:
+        raise ValueError('AGENTICWAM_GRIPPER_LOCK_STEPS must be nonnegative')
+    return recovery in ('1', 'true'), lock_steps
 
 
 def save_three_images_sync(head_img, left_img, right_img, base_dir="concat_img"):
@@ -116,6 +138,8 @@ def convert_obs(obs: Dict[str, Any]) -> Dict[str, Any]:
     state_np[26:32] = trans_utils.euler_angle_to_rot6d(obs["ee_pos_quat"][9:12])
     state_np[32] = 1 if 'open' == obs["gripper_position"][0] else 0
     state_np[33] = 1 if 'open' == obs["gripper_position"][1] else 0
+    validate_rot6d(state_np[17:23])
+    validate_rot6d(state_np[26:32])
     dst_obs["state"] = state_np
     logger.warning(f'obs keys: {obs.keys()}')
     for name in obs.keys():
@@ -127,7 +151,7 @@ def convert_obs(obs: Dict[str, Any]) -> Dict[str, Any]:
             dst_obs['images']['cam_right_wrist'] = obs[name]
         elif name.endswith('_rgb'):
             dst_obs['images'][name[:-4]] = obs[name]
-        else:
+        elif name not in ('state', 'images'):
             dst_obs[name] = obs[name]
 
     return dst_obs
@@ -163,11 +187,13 @@ class SharedPrompt:
 
     def __init__(self, initial_prompt: str = ""):
         self._prompt = (initial_prompt or "").strip()
+        self._revision = 0
         self._lock = threading.Lock()
 
     def set(self, value: str) -> str:
         with self._lock:
             self._prompt = (value or "").strip()
+            self._revision += 1
             return self._prompt
 
     def get(self) -> str:
@@ -176,6 +202,11 @@ class SharedPrompt:
 
     def clear(self) -> None:
         self.set("")
+
+    def snapshot(self):
+        """Every POST /prompt starts a new task, even if its text is unchanged."""
+        with self._lock:
+            return self._prompt, self._revision
 
 
 class PromptRequest(BaseModel):
@@ -387,6 +418,8 @@ class RTCClient:
         self._server_rtc = False
         self._server_prompt: str | None = None
         self._server_id: str | None = None
+        self._protocol_version = 1
+        self._needs_handshake = False
         self._request_lock = asyncio.Lock()  # one model, do not overlap /act and /reset
 
         self.save_viz = self.use_async
@@ -449,7 +482,7 @@ class RTCClient:
 
     async def _handshake(self) -> None:
         health = await self._request("GET", "/health")
-        self._observe_server(health)
+        self._observe_server(health, allow_change=True)
         if health.get("status") != "success":
             raise ConnectionError(f"GET /health failed: {health}")
         for name, expected in (("state_dim", 34), ("action_dim", 20), ("model_dim", 64)):
@@ -461,6 +494,12 @@ class RTCClient:
                 f"RTC config H={self.H} but server chunk_size={actual_h}; "
                 "set cfg.rtc.H to the training action horizon"
             )
+        self._protocol_version = int(health.get('protocol_version', 1))
+        if self._protocol_version >= 2:
+            if health.get('action_type') != 'absolute_eef20' or health.get('rotation6d') != 'first_two_columns':
+                raise ValueError('server action/rotation convention differs from the custom34 client')
+            if health.get('gripper_open_value') != 1 or not health.get('server_id'):
+                raise ValueError('server must declare gripper open=1 and an instance ID')
         self._server_rtc = bool(health.get("rtc_enabled", False))
         if self.use_rtc and self.use_async and not self._server_rtc:
             raise ValueError(
@@ -470,7 +509,7 @@ class RTCClient:
         if self.use_rtc and not self.use_async:
             logger.warning("[RTC] 同步模式下无已执行前缀；请求会使用普通 Action Chunking")
         logger.warning(
-            "[HTTP] server health: state34 -> model64 -> action20, horizon=%d, rtc=%s",
+            "[HTTP] server health: state34 -> model64 -> action20, horizon={}, rtc={}",
             actual_h, self._server_rtc,
         )
         reset = await self._request("POST", "/reset", {})
@@ -478,27 +517,38 @@ class RTCClient:
         if reset.get("status") != "success":
             raise ConnectionError(f"POST /reset failed: {reset}")
         self._server_prompt = None
+        self._needs_handshake = False
         logger.warning("[HTTP] remote episode reset OK")
 
-    def _observe_server(self, result: dict) -> None:
+    def _observe_server(self, result: dict, *, allow_change=False) -> None:
         server_id = result.get('server_id')
+        if getattr(self, '_protocol_version', 1) >= 2 and not server_id:
+            self._needs_handshake = True
+            raise ConnectionError('server response lacks its instance ID')
         if server_id:
             if self._server_id is not None and self._server_id != server_id:
                 logger.warning('[HTTP] backend instance changed: {} -> {}; check server restart/replicas/session routing', self._server_id, server_id)
+                if not allow_change:
+                    self._needs_handshake = True
+                    raise ConnectionError('backend instance changed; discard actions and re-handshake/reset')
             self._server_id = str(server_id)
 
     async def reset_episode(self) -> None:
         """Reset remote episode while serialized with inference requests."""
         async with self._request_lock:
+            if self._needs_handshake:
+                await self._handshake()
+                return
             result = await self._request("POST", "/reset", {})
             self._observe_server(result)
             if result.get("status") != "success":
+                self._needs_handshake = True
                 raise ConnectionError(f"POST /reset failed: {result}")
             self._server_prompt = None
         logger.warning("[HTTP] new episode reset OK")
 
     async def connect(self) -> None:
-        logger.warning("[HTTP] Connecting to %s", self.server_uri)
+        logger.warning("[HTTP] Connecting to {}", self.server_uri)
         async with self._request_lock:
             await self._handshake()
         self.running = True
@@ -522,6 +572,7 @@ class RTCClient:
         # Encode PNG in a worker thread: do not block actuator event loop.
         proc_o = convert_obs(o)
         payload = await asyncio.to_thread(make_zero_observation, proc_o, instruction)
+        payload['request_id'] = os.urandom(16).hex()
         self._last_sent_prefix_len = 0
         self._last_sent_committed_len = 0
         if self._suppress_rtc_once:
@@ -543,30 +594,51 @@ class RTCClient:
             self._last_sent_committed_len = K
 
         async with self._request_lock:
+            if self._needs_handshake:
+                await self._handshake()
+                payload.pop('committed', None)
+                payload.pop('freeze', None)
+                self._last_sent_prefix_len = self._last_sent_committed_len = 0
             # The policy retains code-cache/episode state; a new task must not
             # silently inherit the previous task's program or code history.
             if self._server_prompt is not None and self._server_prompt != instruction:
                 reset = await self._request("POST", "/reset", {})
+                self._observe_server(reset)
                 if reset.get("status") != "success":
                     raise ConnectionError(f"task-switch remote reset failed: {reset}")
                 logger.warning("[HTTP] task changed; remote model episode reset")
                 self._server_prompt = None
             start = time.monotonic()
-            result = await self._request("POST", "/act", payload)
+            try:
+                result = await self._request("POST", "/act", payload)
+            except (ConnectionError, OSError, ValueError):
+                self._needs_handshake = True
+                raise
             self._observe_server(result)
+            if self._protocol_version >= 2 and result.get('request_id') != payload['request_id']:
+                self._needs_handshake = True
+                raise ConnectionError('server request_id mismatch; refusing unrelated action chunk')
             self._last_latency_ms = 1000 * (time.monotonic() - start)
             if result.get("status") == "success":
                 self._server_prompt = instruction
         if result.get("status") != "success":
+            self._needs_handshake = True
             raise ConnectionError(f"server /act error: {result.get('message', result)}")
         action = np.asarray(result.get("action"), dtype=np.float32)
         if action.shape != (self.H, 20) or not np.isfinite(action).all():
+            self._needs_handshake = True
             raise ConnectionError(f"invalid action shape/values: {action.shape}, expected ({self.H},20)")
+        try:
+            validate_rot6d(action[:, 3:9])
+            validate_rot6d(action[:, 12:18])
+        except ValueError as exc:
+            self._needs_handshake = True
+            raise ConnectionError(f'invalid action orientation: {exc}') from exc
         self.inference_count += 1
         estimated_delay = max(1, int(np.ceil(self._last_latency_ms * self.control_hz / 1000.0)))
         self.delay_buffer.append(estimated_delay)
         logger.warning(
-            "[HTTP] inference #%d: server %.0fms / RTT %.0fms, action=%s, rtc_freeze=%d K=%d",
+            "[HTTP] inference #{}: server {:.0f}ms / RTT {:.0f}ms, action={}, rtc_freeze={} K={}",
             self.inference_count, float(result.get("latency", 0)), self._last_latency_ms,
             action.shape, self._last_sent_prefix_len, self._last_sent_committed_len,
         )
@@ -743,6 +815,11 @@ class RTCClient:
 
 @draccus.wrap()
 def main(cfg: BaseConfig):
+    auto_gripper_recovery, gripper_lock_steps = deployment_control_options()
+    if cfg.env.infermode != 'rot6d':
+        raise ValueError('custom34 deployment requires --env.infermode=rot6d (absolute EEF20)')
+    logger.warning('[CONTROL] model gripper actions; lock_steps={} auto_recovery={}',
+                   gripper_lock_steps, auto_gripper_recovery)
     # 可选 RViz 可视化
     if cfg.env.rviz_visualization:
         import rospy
@@ -814,7 +891,7 @@ def main(cfg: BaseConfig):
 
     # 定义夹爪状态稳定器
     class GripperStateStabilizer:
-        def __init__(self, lock_duration=15):
+        def __init__(self, lock_duration=0):
             self.lock_duration = lock_duration  # 状态转换后锁定的步数
             self.last_state = None  # 上一次的夹爪状态，'open'或'close'
             self.lock_counter = 0  # 当前锁定计数
@@ -852,8 +929,8 @@ def main(cfg: BaseConfig):
 
     async def run_loop_async():
         # 初始化左右夹爪的状态稳定器
-        left_gripper_stabilizer = GripperStateStabilizer(lock_duration=0)
-        right_gripper_stabilizer = GripperStateStabilizer(lock_duration=0)
+        left_gripper_stabilizer = GripperStateStabilizer(lock_duration=gripper_lock_steps)
+        right_gripper_stabilizer = GripperStateStabilizer(lock_duration=gripper_lock_steps)
 
         await rtc.connect()
         obs_init, _ = await asyncio.to_thread(env.reset)
@@ -865,6 +942,8 @@ def main(cfg: BaseConfig):
         initial_pose_obs = None
         # 启动后先检查共享指令：为空则空闲等待，非空则在循环内做首次全量重规划
         was_idle = True
+        last_prompt_revision = None
+        episode_reset_pending = False
 
         for step in range(1, cfg.env.num_steps + 1):
             step_time = 1.0 / cfg.env.max_hz if cfg.env.max_hz > 0 else 0
@@ -876,17 +955,19 @@ def main(cfg: BaseConfig):
                 if not was_idle:
                     logger.warning("[REPLAY] 轨迹回放进行中，主循环暂停执行")
                 was_idle = True
+                episode_reset_pending = True
                 await rtc.pause()  # 清除在途重规划结果，防止旧轨迹在恢复后执行
                 obs_for_next_step = None
                 await asyncio.sleep(0.1)
                 continue
 
             # 读取共享任务指令：为空则不执行任何动作，进入空闲等待
-            cur_prompt = shared_prompt.get()
+            cur_prompt, prompt_revision = shared_prompt.snapshot()
             if not cur_prompt:
                 if not was_idle:
                     logger.warning("[PROMPT] 任务指令为空，停止执行动作，进入空闲等待")
                 was_idle = True
+                episode_reset_pending = True
                 await rtc.pause()  # 清除在途重规划结果，防止旧轨迹在恢复后执行
                 obs_for_next_step = None
                 await asyncio.sleep(0.1)
@@ -894,10 +975,11 @@ def main(cfg: BaseConfig):
 
             # 运行中任务切换：先停止旧 chunk，再从新观测全量规划；
             # 不能把上个任务的绝对 EEF 目标继续发给机械臂。
-            if not was_idle and cur_prompt != rtc.prompt:
+            if not was_idle and (cur_prompt != rtc.prompt or prompt_revision != last_prompt_revision):
                 logger.warning("[PROMPT] task changed during execution; discard old chunk and replan")
                 await rtc.pause()
                 was_idle = True
+                episode_reset_pending = True
                 obs_for_next_step = None
                 rtc.prompt = cur_prompt
                 continue
@@ -906,10 +988,21 @@ def main(cfg: BaseConfig):
             if was_idle:
                 logger.warning(f"[PROMPT] 收到任务指令: {cur_prompt}，开始全量重规划")
                 rtc.prompt = cur_prompt
+                if episode_reset_pending:
+                    try:
+                        await rtc.reset_episode()
+                    except (ConnectionError, OSError, ValueError) as exc:
+                        logger.error('[HTTP] episode reset failed; keep paused and retry: {}', exc)
+                        await asyncio.sleep(1.0)
+                        continue
+                    episode_reset_pending = False
+                last_prompt_revision = prompt_revision
                 obs_resume = await get_obs_with_retry()
-                # 保存整个程序首次推理时的初始姿态（仅保存一次，后续空闲恢复不覆盖）
-                if initial_pose_obs is None:
-                    initial_pose_obs = obs_resume
+                # 恢复参考姿态属于当前任务。
+                from copy import deepcopy
+                initial_pose_obs = deepcopy(obs_resume)
+                left_gripper_stabilizer.reset()
+                right_gripper_stabilizer.reset()
                 try:
                     res = await rtc.guided_inference(obs_resume, prefix_action=None, prefix_len=0)
                 except (ConnectionError, OSError, ValueError) as e:
@@ -929,6 +1022,12 @@ def main(cfg: BaseConfig):
             should_get_obs = (current_t >= rtc.s_min - 3)
 
             act = await rtc.get_action(obs_for_next_step)
+            if shared_prompt.snapshot() != (cur_prompt, prompt_revision) or replay_ctrl.is_replaying():
+                await rtc.pause()
+                was_idle = True
+                episode_reset_pending = True
+                obs_for_next_step = None
+                continue
             if cfg.env.infermode == 'rot6d':
                 act_euler_left = np.concatenate([act[:3], trans_utils.rot6d_to_euler_angle(act[3:9])])
                 act_euler_right = np.concatenate([act[9:12], trans_utils.rot6d_to_euler_angle(act[12:18])])
@@ -937,11 +1036,7 @@ def main(cfg: BaseConfig):
                 stable_gripper_left = left_gripper_stabilizer.get_stable_state(act[18])
                 stable_gripper_right = right_gripper_stabilizer.get_stable_state(act[19])
 
-                # 后台推理进行中时，夹具保持打开，不执行夹爪动作
-                if rtc._reinference_pending:
-                    gripper_positions = ["open", "open"]
-                else:
-                    gripper_positions = [stable_gripper_left, stable_gripper_right]
+                gripper_positions = [stable_gripper_left, stable_gripper_right]
 
                 cmd = {'ee_pos_quat': np.concatenate([act_euler_left, act_euler_right]),
                        'gripper_positions': gripper_positions}
@@ -950,11 +1045,7 @@ def main(cfg: BaseConfig):
                 stable_gripper_left = left_gripper_stabilizer.get_stable_state(act[14])
                 stable_gripper_right = right_gripper_stabilizer.get_stable_state(act[15])
 
-                # 后台推理进行中时，夹具保持打开，不执行夹爪动作
-                if rtc._reinference_pending:
-                    gripper_positions = ["open", "open"]
-                else:
-                    gripper_positions = [stable_gripper_left, stable_gripper_right]
+                gripper_positions = [stable_gripper_left, stable_gripper_right]
 
                 cmd = {'joint_positions': np.array(act[:14]),
                        'gripper_positions': gripper_positions}
@@ -985,8 +1076,10 @@ def main(cfg: BaseConfig):
             # 获取观测用于夹具闭合度判断
             if should_get_obs:
                 obs = obs_new
-            else:
+            elif auto_gripper_recovery:
                 obs = await get_obs_with_retry()
+            else:
+                obs = None
 
             arm_actpos = obs.get("arm_actpos", {}) if obs else {}
             left_arm_actpos = []
@@ -996,7 +1089,7 @@ def main(cfg: BaseConfig):
                 right_arm_actpos = arm_actpos.get("right", [])
 
             # 小夹具 0 ~ 1000，0 完全闭合，1000 完全打开
-            if left_arm_actpos and left_arm_actpos[0] < 50:
+            if auto_gripper_recovery and left_arm_actpos and left_arm_actpos[0] < 50:
                 logger.warning("左夹具闭合度接近0，重新打开左夹具，重新推理")
                 reopen_cmd = dict(cmd)
                 reopen_cmd['gripper_positions'] = ["open", stable_gripper_right]
@@ -1023,7 +1116,7 @@ def main(cfg: BaseConfig):
                 await rtc.request_reinference(obs=obs_new)
                 continue
 
-            if right_arm_actpos and right_arm_actpos[0] < 50:
+            if auto_gripper_recovery and right_arm_actpos and right_arm_actpos[0] < 50:
                 logger.warning("右夹具闭合度接近0，重新打开右夹具，重新推理")
                 reopen_cmd = dict(cmd)
                 reopen_cmd['gripper_positions'] = [stable_gripper_left, "open"]
@@ -1070,8 +1163,8 @@ def main(cfg: BaseConfig):
 
     async def run_loop_sync():
         # 初始化左右夹爪的状态稳定器
-        left_gripper_stabilizer = GripperStateStabilizer(lock_duration=15)
-        right_gripper_stabilizer = GripperStateStabilizer(lock_duration=15)
+        left_gripper_stabilizer = GripperStateStabilizer(lock_duration=gripper_lock_steps)
+        right_gripper_stabilizer = GripperStateStabilizer(lock_duration=gripper_lock_steps)
 
         await rtc.connect()
         obs, _ = await asyncio.to_thread(env.reset)
@@ -1085,6 +1178,7 @@ def main(cfg: BaseConfig):
         initial_pose_obs = None
         needs_episode_anchor = True
         episode_reset_pending = False
+        last_prompt_revision = None
 
         while step < total_steps:
             # 子任务轨迹回放进行中：暂停主循环（不推理、不动作），等回放结束后重新规划
@@ -1098,7 +1192,7 @@ def main(cfg: BaseConfig):
                 continue
 
             # 读取共享任务指令：为空则不执行任何动作，进入空闲等待
-            cur_prompt = shared_prompt.get()
+            cur_prompt, prompt_revision = shared_prompt.snapshot()
             if not cur_prompt:
                 if not was_idle:
                     logger.warning("[PROMPT] 任务指令为空，停止执行动作，进入空闲等待")
@@ -1110,16 +1204,22 @@ def main(cfg: BaseConfig):
 
             if was_idle:
                 logger.warning(f"[PROMPT] 收到任务指令: {cur_prompt}，开始全量重规划")
-            if cur_prompt != rtc.prompt:
+            if cur_prompt != rtc.prompt or (last_prompt_revision is not None and prompt_revision != last_prompt_revision):
                 logger.warning(f"[PROMPT] 任务指令实时更新: {cur_prompt}")
                 rtc.prompt = cur_prompt
                 episode_reset_pending = True
                 needs_episode_anchor = True
                 was_idle = True
+            last_prompt_revision = prompt_revision
             # One fresh observation and ONE inference per executed chunk.
             # Retry alone does not create a new episode; task/replay/reset does.
             if episode_reset_pending:
-                await rtc.reset_episode()
+                try:
+                    await rtc.reset_episode()
+                except (ConnectionError, OSError, ValueError) as exc:
+                    logger.error('[HTTP] episode reset failed; keep paused and retry: {}', exc)
+                    await asyncio.sleep(1.0)
+                    continue
                 episode_reset_pending = False
             obs = await get_obs_with_retry()
             if needs_episode_anchor:
@@ -1149,8 +1249,8 @@ def main(cfg: BaseConfig):
                 if step >= total_steps:
                     break
                 # 指令清空或任务切换：立刻停止旧 chunk，重新采集观测/全量规划。
-                current_prompt = shared_prompt.get()
-                if not current_prompt or current_prompt != rtc.prompt or replay_ctrl.is_replaying():
+                current_prompt, current_revision = shared_prompt.snapshot()
+                if not current_prompt or current_prompt != rtc.prompt or current_revision != prompt_revision or replay_ctrl.is_replaying():
                     logger.warning("[CONTROL] instruction changed/cleared or replay active; abort old chunk")
                     was_idle = True
                     episode_reset_pending = True
@@ -1202,7 +1302,7 @@ def main(cfg: BaseConfig):
                     right_arm_actpos = arm_actpos.get("right", [])
 
                 # 小夹具 0 ~ 1000，0 完全闭合，1000 完全打开
-                if left_arm_actpos and left_arm_actpos[0] < 50:
+                if auto_gripper_recovery and left_arm_actpos and left_arm_actpos[0] < 50:
                     logger.warning("左夹具闭合度接近0，重新打开左夹具，重新推理")
                     reopen_cmd = dict(cmd)
                     reopen_cmd['gripper_positions'] = ["open", stable_gripper_right]
@@ -1222,7 +1322,7 @@ def main(cfg: BaseConfig):
                     was_idle = True
                     break
 
-                if right_arm_actpos and right_arm_actpos[0] < 50:
+                if auto_gripper_recovery and right_arm_actpos and right_arm_actpos[0] < 50:
                     logger.warning("右夹具闭合度接近0，重新打开右夹具，重新推理")
                     reopen_cmd = dict(cmd)
                     reopen_cmd['gripper_positions'] = [stable_gripper_left, "open"]
