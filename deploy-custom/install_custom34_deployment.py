@@ -18,6 +18,7 @@ SERVER_FILES = (
     'robotwin/deploy/deploy_policy.py',
     'src/agenticwam/utils/deployment_text_cache.py',
     'src/agenticwam/utils/custom34_review.py',
+    'src/agenticwam/utils/review_vae_decode.py',
     'src/agenticwam/datasets/lerobot/transforms/custom_unified_eef.py',
     'src/agenticwam/datasets/lerobot/transforms/image.py',
     'src/agenticwam/datasets/lerobot/processors/agenticwam_processor.py',

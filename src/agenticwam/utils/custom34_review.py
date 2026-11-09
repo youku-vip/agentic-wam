@@ -124,14 +124,25 @@ def save_video_frames(video, output, roles, *, step_stride=1):
     """Split [1,3,nc*T,H,W] into camera-major PNGs without changing the RGB channel order."""
     video = array(video)
     nc = len(roles)
-    if (video.ndim != 5 or video.shape[0:2] != (1, 3) or video.shape[2] % nc
-            or video.shape[2] == 0 or not np.isfinite(video).all()):
-        raise ValueError(f'expected finite [1,3,nc*T,H,W] video, got {video.shape}')
+    if (not nc or video.ndim != 5 or video.shape[0:2] != (1, 3) or video.shape[2] % nc
+            or video.shape[2] == 0):
+        raise ValueError(f'video shape error: expected [1,3,nc*T,H,W] with nc={nc}, got {video.shape}')
     nframes, height, width = video.shape[2] // nc, video.shape[3], video.shape[4]
-    rgb = np.rint((np.clip(video[0], -1, 1) + 1) * 127.5).astype(np.uint8)
-    rgb = rgb.reshape(3, nc, nframes, height, width).transpose(1, 2, 3, 4, 0)
+    finite = np.isfinite(video)
+    bad_frames = (~finite[0]).reshape(3, nc, nframes, height, width).any(axis=(0, 3, 4))
+    selected = video[finite]
+    diagnostic = dict(shape=list(video.shape), dtype=str(video.dtype), elements=int(video.size),
+                      nan_count=int(np.isnan(video).sum()), posinf_count=int(np.isposinf(video).sum()),
+                      neginf_count=int(np.isneginf(video).sum()), invalid_frame_count=int(bad_frames.sum()),
+                      finite_min=float(selected.min()) if selected.size else None,
+                      finite_max=float(selected.max()) if selected.size else None)
+    views = video[0].reshape(3, nc, nframes, height, width)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
+    (output / 'video_diagnostics.json').write_text(json.dumps(diagnostic, indent=2, allow_nan=False)+'\n')
+    if bad_frames.any():
+        # Preserve the actual tensor for diagnosis; never replace invalid pixels with fake images.
+        np.savez_compressed(output / 'nonfinite_video.npz', video=video)
     sheet = Image.new('RGB', (nframes * width, nc * (height + 22)), 'white')
     draw = ImageDraw.Draw(sheet)
     records = []
@@ -140,16 +151,27 @@ def save_video_frames(video, output, roles, *, step_stride=1):
         folder.mkdir()
         for step in range(nframes):
             name = f'frame_{step:03d}.png'
-            image = Image.fromarray(rgb[camera, step])
-            image.save(folder / name)
-            sheet.paste(image, (step * width, camera * (height+22) + 22))
+            invalid = bool(bad_frames[camera, step])
+            if invalid:
+                left, top = step*width, camera*(height+22)+22
+                draw.rectangle((left, top, left+width-1, top+height-1), fill='#ffe5e5', outline='red')
+                draw.text((left+3, top+3), 'INVALID NaN/Inf', fill='red')
+            else:
+                pixels = views[:, camera, step].transpose(1, 2, 0)
+                rgb = np.rint((np.clip(pixels, -1, 1)+1)*127.5).astype(np.uint8)
+                image = Image.fromarray(rgb)
+                image.save(folder / name)
+                sheet.paste(image, (step * width, camera * (height+22) + 22))
             draw.text((step*width+3, camera*(height+22)+3), f'{role} +{step*step_stride}', fill='black')
-            records.append(dict(camera=role, file=f'{role}/{name}', frame=step,
+            records.append(dict(camera=role, file=None if invalid else f'{role}/{name}', frame=step,
+                                status='nonfinite' if invalid else 'saved',
                                 state_step_offset=step*step_stride,
                                 kind='conditioned_observation' if step == 0 else 'predicted_future'))
     sheet.save(output / 'contact_sheet.png')
     (output / 'frames.json').write_text(json.dumps(records, indent=2) + '\n')
-    return dict(cameras=list(roles), frames_per_camera=nframes, total_images=nc*nframes,
+    return dict(status='partial' if bad_frames.any() else 'saved',
+                cameras=list(roles), frames_per_camera=nframes, total_images=nc*nframes-int(bad_frames.sum()),
+                frame_slots=nc*nframes, **diagnostic,
                 image_size=[height, width], step_stride=step_stride,
                 note='The first decoded frame is the conditioned observation reconstruction.')
 
@@ -228,17 +250,8 @@ def write_review(output, *, raw_images, model_input, generated_video, camera_ord
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     metadata = dict(metadata)
-    metadata['review_version'] = 'custom34-chunk-review-v1'
-    raw = output / 'observation_raw'
-    raw.mkdir()
-    for role, image in raw_images.items():
-        Image.fromarray(image).save(raw / f'{role}.png')
-    if model_input is not None:
-        save_video_frames(model_input, output / 'observation_model_input', camera_order, step_stride=0)
-    if generated_video is None:
-        raise ValueError('model did not return generated video; install the matching deploy_policy.py')
-    metadata['generated_video'] = save_video_frames(generated_video, output / 'generated', camera_order,
-                                                   step_stride=video_step_stride)
+    metadata['review_version'] = 'custom34-chunk-review-v2'
+    metadata['warnings'] = []
     values = dict(state34=np.asarray(state34), pred_action20=np.asarray(prediction20),
                   pred_relative64=np.asarray(prediction64))
     if reference is not None:
@@ -261,14 +274,39 @@ def write_review(output, *, raw_images, model_input, generated_video, camera_ord
                 writer.writerow(row)
     np.savez_compressed(output / 'chunks.npz', **values)
     (output / 'metadata.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False, allow_nan=False) + '\n')
+    # Core action arrays/metrics are already durable. Pixel export cannot suppress them.
+    raw = output / 'observation_raw'
+    raw.mkdir()
+    for role, image in raw_images.items():
+        Image.fromarray(image).save(raw / f'{role}.png')
+    for key, value, folder, stride in (
+        ('model_input_video', model_input, 'observation_model_input', 0),
+        ('generated_video', generated_video, 'generated', video_step_stride),
+    ):
+        if value is None:
+            item = dict(status='missing', message=f'{key} tensor is absent')
+        else:
+            try:
+                item = save_video_frames(value, output/folder, camera_order, step_stride=stride)
+            except Exception as exc:
+                item = dict(status='error', message=f'{type(exc).__name__}: {exc}')
+        metadata[key] = item
+        if item['status'] != 'saved':
+            metadata['warnings'].append(dict(component=key, **item))
     if reference is not None and make_plots:
         write_comparison_plots(output, prediction20, reference, report,
                                pred_relative64=prediction64, gt_relative64=target64)
+    metadata['comparison_ready'] = reference is not None
+    metadata['images_valid'] = not metadata['warnings']
+    metadata['review_status'] = 'partial' if metadata['warnings'] else 'saved'
+    (output / 'metadata.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False, allow_nan=False)+'\n')
     images = ['generated/contact_sheet.png', 'observation_model_input/contact_sheet.png',
               'action20_all_dimensions.png', 'physical_errors.png', 'relative64_all_dimensions.png']
     page = '<!doctype html><meta charset="utf-8"><title>Custom34 chunk review</title>'
     page += '<style>body{font-family:sans-serif;margin:24px}img{max-width:100%}pre{white-space:pre-wrap}</style>'
     page += '<h1>Custom34 chunk review</h1><pre>' + html.escape(json.dumps(metadata, indent=2, ensure_ascii=False)) + '</pre>'
+    if metadata['warnings']:
+        page += '<p style="color:red">Image export contains missing or invalid frames. Action comparisons are separate; see diagnostics.</p>'
     for name in images:
         if (output / name).is_file(): page += f'<h2>{name}</h2><a href="{name}"><img src="{name}"></a>'
     for folder in ('dimensions20',):

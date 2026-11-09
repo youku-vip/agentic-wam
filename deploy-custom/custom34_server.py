@@ -313,6 +313,7 @@ class Custom34Runtime:
             n_cameras=3, num_video_frames=n_v, video_size=video_size,
             text_cache_dir=text_cache_dir, code_prompt_builder=code_prompt_builder,
             capture_generated_video=self.review_dir is not None,
+            vae_review_decode_dtype=args.vae_decode_dtype,
         )
         transforms = self.policy.processor.action_state_transforms
         custom = [t for t in transforms if isinstance(t, CustomUnifiedEEFTransform)]
@@ -508,13 +509,18 @@ class Custom34Runtime:
                         camera_order=list(self.cam_order), stats_sha256=self.stats_sha256,
                         checkpoint=self.checkpoint, video_size=self.video_size,
                         sample_stride=self.sample_stride, video_action_ratio=self.video_action_ratio,
+                        video_decode=getattr(self.policy.model, '_review_video_decode_diagnostics', None),
                         comparison_uses_reference_as_model_input=False)
-        write_review(output, raw_images=images, model_input=getattr(self.policy, '_last_obs_video', None),
+        report = write_review(output, raw_images=images, model_input=getattr(self.policy, '_last_obs_video', None),
                      generated_video=getattr(self.policy, '_last_generated_video', None), camera_order=self.cam_order,
                      state34=state, prediction20=action20, prediction64=delta64, metadata=metadata,
                      reference=reference, target64=target64, video_step_stride=self.video_action_ratio*self.sample_stride)
-        self.last_review['status'] = 'saved'
-        LOG.info('REVIEW saved: %s (expert comparison=%s)', output, reference is not None)
+        self.last_review.update(status=report['review_status'], comparison_ready=report['comparison_ready'],
+                                images_valid=report['images_valid'], image_warnings=report['warnings'])
+        if report['warnings']:
+            LOG.warning('REVIEW action comparison saved; image warnings at %s: %s', output, report['warnings'])
+        else:
+            LOG.info('REVIEW saved: %s (expert comparison=%s)', output, reference is not None)
 
     def reset(self) -> None:
         with self.lock:
@@ -548,6 +554,8 @@ def main():
     ap.add_argument('--review-dir', default='./custom34_reviews',
                     help='save generated camera PNGs and chunk arrays on EVERY /act; reference adds plots')
     ap.add_argument('--no-review', action='store_true', help='disable generated-image capture and review I/O')
+    ap.add_argument('--vae-decode-dtype', choices=('fp32', 'native'), default='fp32',
+                    help='precision for image export only; fp32 temporarily disables VAE autocast, then restores weights')
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--max-body-mb", type=int, default=24)
@@ -646,6 +654,7 @@ def main():
                                  'sample_stride': getattr(rt, 'sample_stride', 1),
                                  'video_action_ratio': getattr(rt, 'video_action_ratio', 4),
                                  'review_enabled': getattr(rt, 'review_dir', None) is not None,
+                                 'vae_review_decode_dtype': getattr(rt.policy.model, '_review_vae_decode_precision', None),
                                  'review_directory': str(rt.review_dir) if getattr(rt, 'review_dir', None) else None,
                                  'last_review': getattr(rt, 'last_review', None)})
 

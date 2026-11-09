@@ -133,8 +133,10 @@ def download_review(base, path, output, timeout):
 
 
 def write_index(output, results, failures):
+    image_warnings = [r for r in results if not r.get('images_valid', True)]
     summary = dict(evaluation='offline expert-observation chunk prediction, not closed-loop task success',
                    chunks=len(results), failed_chunks=len(failures),
+                   image_warning_chunks=len(image_warnings),
                    valid_action_steps=sum(r['valid_steps'] for r in results), results=results, failures=failures)
     (output/'summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False) + '\n')
     page = '<!doctype html><meta charset="utf-8"><title>Custom34 expert comparison</title>'
@@ -148,6 +150,8 @@ def write_index(output, results, failures):
                  f'<td>{result["physical"]["right"]["position_error_mm"]["rmse"]:.3f}</td></tr>')
     page += '</table>'
     if failures: page += '<h2>Failures</h2><pre>'+html.escape(json.dumps(failures, indent=2, ensure_ascii=False))+'</pre>'
+    if image_warnings:
+        page += '<p style="color:red">Some image exports failed or contain NaN/Inf. The action comparisons above remain available; see each chunk diagnostics.</p>'
     (output/'index.html').write_text(page)
 
 
@@ -188,8 +192,10 @@ def run(args):
                 if response.get('server_id') != health.get('server_id') or response.get('request_id') != request_id:
                     raise RuntimeError('mismatched server instance or request ID; refusing comparison')
                 review = response.get('review') or {}
-                if review.get('status') != 'saved' or not review.get('has_reference'):
+                if review.get('status') not in ('saved', 'partial') or not review.get('has_reference'):
                     raise RuntimeError(f'server did not save images/comparison: {review}')
+                if review.get('status') == 'partial' and not review.get('comparison_ready'):
+                    raise RuntimeError(f'action comparison is not complete: {review}')
                 case = output/folder
                 case.mkdir()
                 download_review(base, review['download_url'], case, args.timeout)
@@ -204,15 +210,22 @@ def run(args):
                 (case/'video_alignment.json').write_text(json.dumps(sample['timing'], indent=2)+'\n')
                 report = json.loads((case/'metrics.json').read_text())
                 result = dict(folder=folder, episode=episode, start_frame=start, instruction=sample['instruction'],
+                              images_valid=metadata.get('images_valid', True),
+                              image_warnings=metadata.get('warnings', []),
                               valid_steps=report['valid_steps'], physical=report['physical'], server_review=review)
                 results.append(result)
                 print(f'[review] {folder}: {report["valid_steps"]}/32 valid steps; saved {case}', flush=True)
+                if not result['images_valid']:
+                    print(f'[review] IMAGE WARNING {folder}: action curves saved; inspect metadata.json and generated/video_diagnostics.json',
+                          file=sys.stderr, flush=True)
             except Exception as exc:
                 failures.append(dict(episode=episode, start_frame=start, error=f'{type(exc).__name__}: {exc}'))
                 print(f'[review] FAILED {folder}: {type(exc).__name__}: {exc}', file=sys.stderr, flush=True)
             write_index(output, results, failures)
-    print(json.dumps(dict(output=str(output), passed_chunks=len(results), failed_chunks=len(failures)), indent=2))
-    return 1 if failures else 0
+    partial = sum(not r['images_valid'] for r in results)
+    print(json.dumps(dict(output=str(output), compared_chunks=len(results), passed_chunks=len(results)-partial,
+                          image_warning_chunks=partial, failed_chunks=len(failures)), indent=2))
+    return 1 if failures else (2 if partial else 0)
 
 
 def main():

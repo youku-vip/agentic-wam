@@ -271,7 +271,7 @@ class AgenticWAMCosmosRobotWinPolicy:
                  device, action_horizon, replan_steps, num_inference_steps, sigma_shift,
                  seed, text_ckpt_dir, text_max_len, n_cameras, num_video_frames,
                  video_log_dir=None, video_size=None, text_cache_dir=None, code_prompt_builder=None,
-                 capture_generated_video=False):
+                 capture_generated_video=False, vae_review_decode_dtype="native"):
         # The checkpoint supplies every trained weight (dit.*, proprio_encoder.*, code_vision.*); the frozen
         # VAE comes from wan_vae_path. No Cosmos video checkpoint is read at inference.
         mc = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
@@ -295,6 +295,10 @@ class AgenticWAMCosmosRobotWinPolicy:
 
         self.code_prompt_builder = code_prompt_builder
         self.capture_generated_video = bool(capture_generated_video)
+        if self.capture_generated_video:
+            from agenticwam.utils.review_vae_decode import install_review_vae_decode
+            install_review_vae_decode(self.model, vae_review_decode_dtype)
+            logger.info("Review VAE decode precision=%s (pixel export only)", vae_review_decode_dtype)
         self._last_generated_video = None
         self._last_obs_video = None
         if text_cache_dir is not None:

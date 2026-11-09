@@ -1,5 +1,7 @@
 # 保存生成图像并对比专家 32 步动作
 
+v4.1 对非有限生成帧的处理、局部 FP32 解码与升级命令见 [REVIEW_NONFINITE_FIX.md](REVIEW_NONFINITE_FIX.md)。
+
 此功能使用数据集中的专家动作 `action[t:t+32]` 作对照。模型只接收第 t 帧的观测图像、state34 和任务文本。专家未来动作仅用于推理后的指标与绘图，不作为模型输入。
 
 支持清洗前、清洗后的单个 LeRobot v3 数据集根目录。动作比较使用反归一化后的绝对 EEF20；另输出以同一个 state[t] 为基准的相对 EEF64 对比。不会把归一化动作和原始坐标混在一起比较，也不会用后续 observation.state 冒充专家 action。
@@ -18,9 +20,9 @@
 ```bash
 cd /data/algorithm/agentic-wam
 PY=/usr/local/bin/python3.11
-PKG=/tmp/custom34-deployment-v4
-curl -fL 'https://github.com/youku-vip/agentic-wam/raw/refs/heads/codex/custom-data-review-files/deliveries/custom34-deployment-v4.zip' -o /tmp/custom34-deployment-v4.zip
-"$PY" -m zipfile -e /tmp/custom34-deployment-v4.zip "$PKG"
+PKG=/tmp/custom34-deployment-v4.1
+curl -fL 'https://github.com/youku-vip/agentic-wam/raw/refs/heads/codex/custom-data-review-files/deliveries/custom34-deployment-v4.1.zip' -o /tmp/custom34-deployment-v4.1.zip
+"$PY" -m zipfile -e /tmp/custom34-deployment-v4.1.zip "$PKG"
 ```
 
 手动备份并复制表中四个文件，目标根目录为 `/data/algorithm/agentic-wam`。完整备份安装器也保留在包内，适用于首次安装。
@@ -48,6 +50,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/src" "$PY" deploy-custom/custom34_server
   --device cuda:0 \
   --num-inference-steps 10 \
   --review-dir ./custom34_reviews \
+  --vae-decode-dtype fp32 \
   --code-log-dir ./custom34_code_logs \
   --host 0.0.0.0 --port 8765
 ```
@@ -119,5 +122,7 @@ CUDA_VISIBLE_DEVICES="" PYTHONPATH="$PWD/src" "$PY" deploy-custom/review_custom3
 ## HTTP 扩展（客户端不必修改）
 
 普通 /act 请求仍然只有 instruction/state/images 等字段，自动保存预测图像和动作。离线脚本额外发送 reference={action20:[32,20], valid_mask:[32], fps:10, source:{...}}，此字段只用于推理后的对比。
+
+非有限视频标为 partial，仍导出动作对比；无效帧不作为正常 PNG 保存，详见上面的 v4.1 修复说明。
 
 响应增加 review={status,id,path,download_url,has_reference}。GET /health 包含 review_enabled 和保存位置。GET /reviews/<id>/bundle.zip 可下载该次保存的图片、数组与报告。离线脚本会核对请求 ID、服务实例 ID、下载的预测动作及专家动作，防止混入另一请求的结果。

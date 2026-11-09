@@ -105,6 +105,27 @@ def test_camera_major_frame_export_and_rgb_are_exact(tmp_path):
     assert frames[1]['kind'] == 'predicted_future' and frames[1]['state_step_offset'] == 4
 
 
+@pytest.mark.parametrize('bad_value', [float('nan'), float('inf'), -float('inf')])
+def test_nonfinite_frames_are_diagnosed_and_never_saved_as_fake_black_images(tmp_path, bad_value):
+    pixels = video(2)
+    pixels[0, 0, 1, 0, 0] = bad_value
+    out = tmp_path/'generated'
+    report = save_video_frames(pixels, out, ('head', 'left', 'right'))
+    assert report['status'] == 'partial' and report['invalid_frame_count'] == 1
+    assert report['total_images'] == 5 and not (out/'head/frame_001.png').exists()
+    assert (out/'head/frame_000.png').is_file()
+    assert sum(report[key] for key in ('nan_count', 'posinf_count', 'neginf_count')) == 1
+    with np.load(out/'nonfinite_video.npz', allow_pickle=False) as saved:
+        assert not np.isfinite(saved['video'][0, 0, 1, 0, 0])
+    frames = json.loads((out/'frames.json').read_text())
+    assert frames[1]['status'] == 'nonfinite' and frames[1]['file'] is None
+
+
+def test_wrong_video_shape_has_a_distinct_error(tmp_path):
+    with pytest.raises(ValueError, match='video shape error'):
+        save_video_frames(np.zeros((1, 3, 28, 16, 32)), tmp_path/'bad', ('head', 'left', 'right'))
+
+
 def test_actual_policy_requests_generated_frames_on_every_inference():
     tree = ast.parse((ROOT/'robotwin/deploy/deploy_policy.py').read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'AgenticWAMCosmosRobotWinPolicy')
@@ -182,6 +203,30 @@ def test_review_write_failure_does_not_discard_computed_action(tmp_path, monkeyp
     result, _, _ = rt.infer(contract.request_body())
     assert result.shape == (32, 20) and rt.calls == 1
     assert rt.last_review['status'] == 'error' and 'disk full' in rt.last_review['message']
+
+
+def test_nonfinite_video_preserves_real_action_comparison_figures_and_arrays(tmp_path):
+    rt = runtime(tmp_path)
+    original = rt.policy._infer_action_chunk
+    def infer(ob, instruction):
+        result = original(ob, instruction)
+        rt.policy._last_generated_video = torch.full_like(video(), float('nan'))
+        return result
+    rt.policy._infer_action_chunk = infer
+    body = contract.request_body()
+    body['reference'] = dict(action20=actions().tolist())
+    prediction, _, _ = rt.infer(body)
+    result = rt.last_review
+    assert result['status'] == 'partial' and result['comparison_ready'] and not result['images_valid']
+    out = Path(result['path'])
+    assert (out/'action20_all_dimensions.png').is_file()
+    assert (out/'relative64_all_dimensions.png').is_file()
+    assert len(list((out/'dimensions20').glob('*.png'))) == 20
+    with np.load(out/'chunks.npz', allow_pickle=False) as values:
+        assert np.array_equal(values['pred_action20'], prediction)
+        assert np.isfinite(values['gt_action20']).all()
+    assert not list((out/'generated').glob('*/frame_*.png'))
+    assert (out/'generated/nonfinite_video.npz').is_file()
 
 
 def test_plot_failure_preserves_arrays_and_marks_review_incomplete(tmp_path, monkeypatch):
@@ -269,10 +314,18 @@ def test_tail_padding_is_marked_and_cannot_cross_episode(tmp_path):
     assert item['reference']['source']['action_frame_indices'][-2:] == [39, 39]
 
 
-def test_offline_client_downloads_actual_http_review_bundle(tmp_path, monkeypatch):
+@pytest.mark.parametrize('nonfinite', [False, True])
+def test_offline_client_downloads_actual_http_review_bundle(tmp_path, monkeypatch, nonfinite):
     # Plotting itself is exercised above. Keep the HTTP/packed-video roundtrip lightweight.
     monkeypatch.setattr('agenticwam.utils.custom34_review.write_comparison_plots', lambda *a, **k: None)
     rt = runtime(tmp_path/'server_reviews')
+    if nonfinite:
+        original = rt.policy._infer_action_chunk
+        def infer(ob, instruction):
+            result = original(ob, instruction)
+            rt.policy._last_generated_video = torch.full_like(video(), float('nan'))
+            return result
+        rt.policy._infer_action_chunk = infer
     holder, ready = [], threading.Event()
     class TestServer(server.InferenceServer):
         def __init__(self, *args, **kwargs):
@@ -289,9 +342,11 @@ def test_offline_client_downloads_actual_http_review_bundle(tmp_path, monkeypatc
     try:
         args = SimpleNamespace(root=make_dataset(tmp_path/'raw'), server=base, timeout=60,
                                camera_key=[], episodes=[0], start_frames=[0], padding='error', out=tmp_path/'results')
-        assert review.run(args) == 0
-        assert (args.out/'episode000000_frame000000/generated/head/frame_008.png').is_file()
+        assert review.run(args) == (2 if nonfinite else 0)
+        image_file = 'nonfinite_video.npz' if nonfinite else 'head/frame_008.png'
+        assert (args.out/'episode000000_frame000000/generated'/image_file).is_file()
         assert json.loads((args.out/'summary.json').read_text())['valid_action_steps'] == 32
+        assert json.loads((args.out/'summary.json').read_text())['image_warning_chunks'] == int(nonfinite)
         assert (args.out/'index.html').is_file()
         with pytest.raises(Exception):
             urlopen(base+'/reviews/../../etc/passwd/bundle.zip')
