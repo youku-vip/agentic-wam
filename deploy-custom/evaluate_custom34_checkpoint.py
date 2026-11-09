@@ -24,7 +24,7 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'src'))
-TOOL_VERSION = '1.1'
+TOOL_VERSION = '1.2'
 
 
 def sha256(path):
@@ -216,6 +216,11 @@ def absolute_prediction(normalized, state, transform, normalizer, key):
     return relative, absolute.numpy()
 
 
+def action_reference(actions, mask, fps, source):
+    from agenticwam.utils.custom34_review import validate_reference
+    return validate_reference(dict(action20=actions, valid_mask=mask, fps=fps, source=source), len(actions))
+
+
 def run(args):
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
@@ -332,9 +337,8 @@ def run(args):
                         normalized, code, obs, prompt = infer_once(model, batch, steps=steps, canvas=canvas, seed=seed)
                         relative, pred20 = absolute_prediction(normalized, state, transform,
                                                                processor.normalizer.normalizers['action'][key], key)
-                        reference = dict(action20=gt20.tolist(), valid_mask=valid.tolist(),
-                                         fps=reader.fps/stride, source=dict(root=str(reader.root), episode=episode, start_frame=start))
-                        metrics = compare_actions(pred20, reference, pred_relative64=relative.numpy(), gt_relative64=gt64.numpy())
+                        reference = action_reference(gt20, valid, reader.fps/stride,
+                                                     dict(root=str(reader.root), episode=episode, start_frame=start))
                         cm = code_metrics(code, target, model.code_expert.tokenizer, canvas)
                         prefix = '' if os.environ.get('AGENTICWAM_CODE_NO_INSTRUCTION') == '1' else (prompt if prompt.startswith('# Instruction:') else f'# Instruction: {prompt}\n')
                         plen = len(model.code_expert.tokenizer.encode(prefix, add_special_tokens=False))
@@ -348,11 +352,24 @@ def run(args):
                         (case/'prediction.py').write_text(code+'\n')
                         (case/'target.py').write_text(target)
                         (case/'prompt.txt').write_text(prefix)
+                        # Keep the actual predictions even if a later metric/image export fails.
+                        metrics = compare_actions(pred20, reference, pred_relative64=relative.numpy(), gt_relative64=gt64.numpy())
                         (case/'metrics.json').write_text(json.dumps(metrics, indent=2, allow_nan=False)+'\n')
                         (case/'code_metrics.json').write_text(json.dumps(cm, indent=2, allow_nan=False)+'\n')
-                        save_video_frames(obs, case/'observation_model_input', cameras, step_stride=0)
+                        artifact_warnings = []
+                        try:
+                            images = save_video_frames(obs, case/'observation_model_input', cameras, step_stride=0)
+                            if images['status'] != 'saved':
+                                artifact_warnings.append(dict(component='observation_images', diagnostic=images))
+                        except Exception as exc:
+                            artifact_warnings.append(dict(component='observation_images', error=f'{type(exc).__name__}: {exc}'))
+                            (case/'observation_export_error.log').write_text(traceback.format_exc())
                         if args.plots:
-                            write_comparison_plots(case, pred20, reference, metrics, pred_relative64=relative.numpy(), gt_relative64=gt64.numpy())
+                            try:
+                                write_comparison_plots(case, pred20, reference, metrics, pred_relative64=relative.numpy(), gt_relative64=gt64.numpy())
+                            except Exception as exc:
+                                artifact_warnings.append(dict(component='comparison_plots', error=f'{type(exc).__name__}: {exc}'))
+                                (case/'plot_export_error.log').write_text(traceback.format_exc())
                         item = dict(episode=episode, frame=start, global_index=index, seed=seed, inference_steps=steps,
                                     folder=folder, valid_action_steps=int(valid.sum()), code_metrics=cm,
                                     physical=metrics['physical'], target=target, prediction=code,
@@ -360,7 +377,7 @@ def run(args):
                                     normalized_action_matches_raw_max_error=action_error,
                                     input_fingerprints=dict(observation=tensor_fingerprint(obs), proprio=tensor_fingerprint(batch['proprio'][:, :1]),
                                                             prompt_embs=tensor_fingerprint(batch['prompt_embs'])),
-                                    seconds=time.perf_counter()-started)
+                                    artifact_warnings=artifact_warnings, seconds=time.perf_counter()-started)
                         results.append(item)
                         with (out/'code_eval.jsonl').open('a') as f:
                             f.write(json.dumps(item, ensure_ascii=False, allow_nan=False)+'\n')
@@ -373,10 +390,12 @@ def run(args):
                         failures.append(dict(folder=folder, error=f'{type(exc).__name__}: {exc}',
                                              traceback_file=str(trace_path.relative_to(out))))
                         print(f'[checkpoint-eval] FAILED {folder}: {exc}', file=sys.stderr, flush=True)
-    summary = dict(provenance=provenance, completed=len(results), failures=failures, results=results)
+    warning_cases = sum(bool(r['artifact_warnings']) for r in results)
+    summary = dict(provenance=provenance, completed=len(results), failures=failures,
+                   artifact_warning_cases=warning_cases, results=results)
     (out/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False)+'\n')
     print('[checkpoint-eval] summary:', out/'summary.json', flush=True)
-    return 1 if failures else 0
+    return 1 if failures else (2 if warning_cases else 0)
 
 
 def main():

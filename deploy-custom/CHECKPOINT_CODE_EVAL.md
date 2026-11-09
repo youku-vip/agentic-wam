@@ -10,6 +10,12 @@ v1 的构造器会留下部分 FP32 模块，独立评测没有经过训练时 D
 
 v1.1 在加载权重后统一浮点参数和浮点 buffer 的推理精度，并使用 `Module.bfloat16()/half()/float()` 保留复数 RoPE 和整数 buffer。`run.json` 记录版本和转换前后的 dtype 数量；逐 case 失败时另存完整堆栈到 `errors/`。这一修复只涉及离线评测工具。
 
+## v1.2 指标和报告修复
+
+v1/v1.1 曾把专家动作和有效掩码转成 Python list 后直接交给要求 NumPy 数组的指标函数，导致推理后报 `list indices must be integers or slices, not tuple`。v1.2 先通过共享的 `validate_reference` 校验并转换类型，保存实际预测数组后再计算指标。图片或绘图导出失败会记录为 artifact warning，保留已完成的数值评测；退出码 2 表示数值完成但有图片/图表警告，退出码 1 表示存在推理或指标失败。
+
+新增完整控制流程的 CPU 集成验证：使用模拟的数据源和模型，通过真实动作转换、归一化、指标、图片和全部对比图导出。也验证尾部补齐排除和绘图失败不丢弃数值评测。这不等同于在用户 GPU 上运行真实模型。
+
 ## 安装
 
 将 `deploy-custom/evaluate_custom34_checkpoint.py` 放到同名目录。其他训练/服务端文件不需要替换；依赖当前项目已有的模型、数据读取、CustomUnifiedEEFTransform 和 custom34_review 模块。
