@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
+import warnings
 from unittest.mock import patch
 
 import numpy as np
@@ -51,6 +52,28 @@ def sample():
 
 
 class CheckpointEvalTests(unittest.TestCase):
+    def test_mixed_builder_dtypes_are_unified_without_corrupting_rope(self):
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2).bfloat16())
+        rope = torch.tensor([1+2j, 3-4j], dtype=torch.complex64)
+        model.register_buffer('rope', rope.clone())
+        model.register_buffer('indices', torch.tensor([1, 2], dtype=torch.int64))
+        with self.assertRaisesRegex(RuntimeError, 'dtype'):
+            model(torch.ones(1, 4))
+        with warnings.catch_warnings(record=True) as captured:
+            profile = tool.prepare_inference_model(model, 'cpu', torch.bfloat16)
+        self.assertFalse(any('complex' in str(w.message) for w in captured))
+        self.assertEqual(set(profile['after']['parameters']), {'torch.bfloat16'})
+        self.assertEqual(model.rope.dtype, torch.complex64)
+        self.assertTrue(torch.equal(model.rope, rope))
+        self.assertEqual(model.indices.dtype, torch.int64)
+        self.assertEqual(model(torch.ones(1, 4, dtype=torch.bfloat16)).dtype, torch.bfloat16)
+
+    def test_fp32_mode_also_unifies_builder_dtypes(self):
+        model = torch.nn.Sequential(torch.nn.Linear(4, 4).bfloat16(), torch.nn.Linear(4, 2))
+        profile = tool.prepare_inference_model(model, 'cpu', torch.float32)
+        self.assertEqual(set(profile['after']['parameters']), {'torch.float32'})
+        self.assertEqual(model(torch.ones(1, 4)).dtype, torch.float32)
+
     def test_first_frame_of_each_camera(self):
         obs, frames = tool.observation_frames(sample()['video'], 3)
         self.assertEqual(frames, 9)

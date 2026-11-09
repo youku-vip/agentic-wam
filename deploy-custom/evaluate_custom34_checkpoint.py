@@ -17,12 +17,14 @@ from pathlib import Path
 import random
 import sys
 import time
+import traceback
 
 import numpy as np
 import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'src'))
+TOOL_VERSION = '1.1'
 
 
 def sha256(path):
@@ -33,6 +35,28 @@ def tensor_fingerprint(value):
     value = value.detach().cpu().contiguous()
     return dict(shape=list(value.shape), dtype=str(value.dtype),
                 sha256=hashlib.sha256(value.reshape(-1).view(torch.uint8).numpy().tobytes()).hexdigest())
+
+
+def dtype_profile(model):
+    return dict(parameters=dict(Counter(str(p.dtype) for p in model.parameters())),
+                buffers=dict(Counter(str(b.dtype) for b in model.buffers())))
+
+
+def prepare_inference_model(model, device, dtype):
+    """Builders leave some modules FP32; training's DeepSpeed normally casts them.
+
+    Module.bfloat16/half/float cast floating tensors while preserving complex RoPE
+    and integer buffers. Module.to(dtype=...) would also cast complex buffers.
+    """
+    before = dtype_profile(model)
+    model.to(device=device)
+    method = {torch.bfloat16: 'bfloat16', torch.float16: 'half', torch.float32: 'float'}[dtype]
+    getattr(model, method)()
+    model.eval()
+    if any(p.is_floating_point() and p.dtype != dtype for p in model.parameters()):
+        raise RuntimeError('model still has floating parameters with inconsistent inference precision')
+    return dict(before=before, after=dtype_profile(model),
+                policy='cast floating tensors; preserve complex and integer tensors')
 
 
 def ast_tree(code):
@@ -263,10 +287,12 @@ def run(args):
     if loaded.unexpected_keys:
         raise ValueError(f'checkpoint/config mismatch; unexpected keys: {loaded.unexpected_keys[:8]}')
     del sd, payload
-    model.eval()
+    precision_profile = prepare_inference_model(model, args.device, dtype)
+    print('[checkpoint-eval] model precision:', json.dumps(precision_profile['after']), flush=True)
     canvases = args.canvas_tokens or [model._resolve_infer_code_tokens()]
     out.mkdir(parents=True)
     provenance = dict(evaluation='offline checkpoint generation through training loader; not historical training logs',
+                      tool_version=TOOL_VERSION, model_precision_profile=precision_profile,
                       checkpoint=str(args.checkpoint.resolve()), step=step, config_sha256=sha256(args.train_config),
                       stats_sha256=sha256(stats), precision=precision, device=args.device,
                       required_checkpoint_tensors=len(required), inference_steps=args.inference_steps,
@@ -340,7 +366,12 @@ def run(args):
                             f.write(json.dumps(item, ensure_ascii=False, allow_nan=False)+'\n')
                         print(f'[checkpoint-eval] {folder}: API={cm["api_valid"]} stage={cm["primitive_sequence_match"]} left_pos_rmse={metrics["physical"]["left"]["position_error_mm"]["rmse"]:.2f}mm target_tokens={cm["target_tokens"]}/{canvas}', flush=True)
                     except Exception as exc:
-                        failures.append(dict(folder=folder, error=f'{type(exc).__name__}: {exc}'))
+                        errors = out/'errors'
+                        errors.mkdir(exist_ok=True)
+                        trace_path = errors/f'{folder}.log'
+                        trace_path.write_text(traceback.format_exc())
+                        failures.append(dict(folder=folder, error=f'{type(exc).__name__}: {exc}',
+                                             traceback_file=str(trace_path.relative_to(out))))
                         print(f'[checkpoint-eval] FAILED {folder}: {exc}', file=sys.stderr, flush=True)
     summary = dict(provenance=provenance, completed=len(results), failures=failures, results=results)
     (out/'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False)+'\n')

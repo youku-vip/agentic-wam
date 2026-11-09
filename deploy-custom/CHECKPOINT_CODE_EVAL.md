@@ -4,6 +4,12 @@
 
 本工具重新加载已有权重，通过 **config.yaml 中原训练数据读取和预处理流程** 生成代码与动作。它不会恢复训练，不创建优化器，不使用 DeepSpeed，不访问机器人或 HTTP 服务，也不解码生成视频的像素。因此不能把新结果称为第 8000 步训练当时的历史日志。
 
+## v1.1 精度修复
+
+v1 的构造器会留下部分 FP32 模块，独立评测没有经过训练时 DeepSpeed 的类型统一，因此可能报 `mat1 and mat2 must have the same dtype, but got Float and BFloat16`。这不是一次成功的模型效果评测，`completed=0` 不能解读为准确率为零。
+
+v1.1 在加载权重后统一浮点参数和浮点 buffer 的推理精度，并使用 `Module.bfloat16()/half()/float()` 保留复数 RoPE 和整数 buffer。`run.json` 记录版本和转换前后的 dtype 数量；逐 case 失败时另存完整堆栈到 `errors/`。这一修复只涉及离线评测工具。
+
 ## 安装
 
 将 `deploy-custom/evaluate_custom34_checkpoint.py` 放到同名目录。其他训练/服务端文件不需要替换；依赖当前项目已有的模型、数据读取、CustomUnifiedEEFTransform 和 custom34_review 模块。
@@ -59,4 +65,4 @@ API 完整性与语法不同：例如 `target_rpy=[179.56,-82.64]` 的 Python �
 
 ## 已完成与未完成验证
 
-在 CPU 上验证了三路首帧选择、代码参数检查、左右臂匹配、禁止执行生成代码、静默换样本保护、随机种子/scheduler 恢复（包括异常路径），以及相对动作到绝对动作只逆归一化一次的还原。未在本环境加载用户的大模型权重或运行真实 GPU 推理；实际 tokenizer 长度和 checkpoint 效果由上述命令在用户环境测量。
+在 CPU 上验证了混合 FP32/BF16 模块可重现原错误、统一精度后可运行且复数/整数 buffer 保留，以及三路首帧选择、代码参数检查、左右臂匹配、禁止执行生成代码、静默换样本保护、随机种子/scheduler 恢复（包括异常路径）、相对动作到绝对动作只逆归一化一次的还原。未在本环境加载用户的大模型权重或运行真实 GPU 推理；实际 tokenizer 长度和 checkpoint 效果由上述命令在用户环境测量。
