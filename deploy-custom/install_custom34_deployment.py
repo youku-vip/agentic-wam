@@ -14,11 +14,14 @@ import tempfile
 
 SERVER_FILES = (
     'deploy-custom/custom34_server.py',
+    'deploy-custom/review_custom34_chunks.py',
     'robotwin/deploy/deploy_policy.py',
     'src/agenticwam/utils/deployment_text_cache.py',
+    'src/agenticwam/utils/custom34_review.py',
     'src/agenticwam/datasets/lerobot/transforms/custom_unified_eef.py',
     'src/agenticwam/datasets/lerobot/transforms/image.py',
     'src/agenticwam/datasets/lerobot/processors/agenticwam_processor.py',
+    'src/agenticwam/datasets/lerobot/v3/episode_reader.py',
 )
 CLIENT_SOURCE = 'deploy-custom/rtc_client_agenticwam.py'
 
@@ -81,7 +84,7 @@ def install(package_root, server_root=None, client_file=None, dry_run=False):
         return None
     backup_parent = server_root if server_root is not None else Path(client_file).resolve().parent.parent
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    backup = backup_parent / 'deployment_backups' / f'custom34-v3-{stamp}-{os.urandom(3).hex()}'
+    backup = backup_parent / 'deployment_backups' / f'{manifest["version"]}-{stamp}-{os.urandom(3).hex()}'
     backup.mkdir(parents=True)
     records = []
     # Finish every backup before the first replacement.

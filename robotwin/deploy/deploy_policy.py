@@ -270,7 +270,8 @@ class AgenticWAMCosmosRobotWinPolicy:
     def __init__(self, model_cfg, processor_cfg, checkpoint_path, dataset_stats_path,
                  device, action_horizon, replan_steps, num_inference_steps, sigma_shift,
                  seed, text_ckpt_dir, text_max_len, n_cameras, num_video_frames,
-                 video_log_dir=None, video_size=None, text_cache_dir=None, code_prompt_builder=None):
+                 video_log_dir=None, video_size=None, text_cache_dir=None, code_prompt_builder=None,
+                 capture_generated_video=False):
         # The checkpoint supplies every trained weight (dit.*, proprio_encoder.*, code_vision.*); the frozen
         # VAE comes from wan_vae_path. No Cosmos video checkpoint is read at inference.
         mc = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
@@ -293,6 +294,9 @@ class AgenticWAMCosmosRobotWinPolicy:
         self.processor.set_normalizer_from_stats(load_dataset_stats_from_json(str(dataset_stats_path)))
 
         self.code_prompt_builder = code_prompt_builder
+        self.capture_generated_video = bool(capture_generated_video)
+        self._last_generated_video = None
+        self._last_obs_video = None
         if text_cache_dir is not None:
             from agenticwam.utils.deployment_text_cache import CachedCosmosTextEncoder
             self.text = CachedCosmosTextEncoder(text_cache_dir)
@@ -482,7 +486,11 @@ class AgenticWAMCosmosRobotWinPolicy:
         return AgenticWAMCosmosRobotWinPolicy._CANON_MAP.get(task, instruction)
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
+        self._last_generated_video = None
+        self._last_obs_video = None
         obs_video = self._build_obs_video(observation)
+        if getattr(self, "capture_generated_video", False):
+            self._last_obs_video = obs_video.detach().cpu()
         state = np.asarray(observation["joint_action"]["vector"], dtype=np.float32)
         proprio = self._normalize_state(state).to(self.device)              # [1,64]
         # Training set `episode_instruction_map`, which replaces each episode's randomised
@@ -542,7 +550,8 @@ class AgenticWAMCosmosRobotWinPolicy:
                      if os.environ.get("AGENTICWAM_CODE_EPISODE_INSTR") else wrapped_instruction)
             code_instruction = self._skill_prompt() + _base
         prompt_embs = self.text.encode(wrapped_instruction).to(self.device)
-        want_video = self.video_log_dir is not None and (self._save_all_replans or self.step_count == 0)
+        want_video = (getattr(self, "capture_generated_video", False)
+                      or (self.video_log_dir is not None and (self._save_all_replans or self.step_count == 0)))
         use_code = bool(getattr(self.model, "use_code_expert", False))
         with torch.no_grad():
             if use_code:
@@ -600,7 +609,9 @@ class AgenticWAMCosmosRobotWinPolicy:
             act, gen_video = out
         else:
             act = out                                                       # [T,64] fp32 cpu
-        if gen_video is not None:
+        if gen_video is not None and getattr(self, "capture_generated_video", False):
+            self._last_generated_video = gen_video.detach().cpu()
+        if gen_video is not None and self.video_log_dir is not None:
             try:
                 self._save_generated_video(gen_video, instruction)
             except Exception as e:

@@ -1,6 +1,8 @@
-# Custom34 服务端与客户端部署 v3
+# Custom34 服务端与客户端部署 v4
 
 适用于本项目的双臂夹爪自定义数据：raw state34 → unified EEF64 → 模型相对动作64 → absolute EEF action20。原始、清洗后的数据都通过对应训练 run 的配置和统计值部署。代码基于本次上传的旧服务端和 RealMan/ZMQ 客户端修改。
+
+新增每次推理生成图像保存与专家 32 步动作逐维对比，完整命令见 [CHUNK_REVIEW.md](CHUNK_REVIEW.md)。
 
 默认同步推理，RTC 关闭；夹爪按模型动作执行（>0.5 为 open，否则 close）。默认无 15 步锁爪、无闭合度低于 50 后自动开爪回位。客户端传原始 RGB 图像，服务端按训练 processor 的尺寸和模式处理；256×448 letterbox 的 checkpoint 会继续使用该设置。部署不修改训练配置。
 
@@ -11,13 +13,13 @@
 ```bash
 cd /data/algorithm/agentic-wam
 PY=/usr/local/bin/python3.11
-PKG="$PWD/custom34-deployment-v3"
-curl -fL 'https://github.com/youku-vip/agentic-wam/raw/refs/heads/codex/custom-data-review-files/deliveries/custom34-deployment-v3.zip' -o /tmp/custom34-deployment-v3.zip
-"$PY" -m zipfile -e /tmp/custom34-deployment-v3.zip "$PKG"
+PKG="$PWD/custom34-deployment-v4"
+curl -fL 'https://github.com/youku-vip/agentic-wam/raw/refs/heads/codex/custom-data-review-files/deliveries/custom34-deployment-v4.zip' -o /tmp/custom34-deployment-v4.zip
+"$PY" -m zipfile -e /tmp/custom34-deployment-v4.zip "$PKG"
 "$PY" "$PKG/deploy-custom/install_custom34_deployment.py" --server-root "$PWD"
 ```
 
-安装器检查压缩包文件哈希，先备份全部将替换的文件，再安装六个服务端文件。备份清单路径会打印为 `BACKUP .../manifest.json`。它不覆盖 YAML、train.sh、数据或模型文件。
+安装器检查压缩包文件哈希，先备份全部将替换的文件，再安装九个服务端文件。备份清单路径会打印为 `BACKUP .../manifest.json`。它不覆盖 YAML、train.sh、数据或模型文件。
 
 ## 2. GPU 服务端启动
 
@@ -35,6 +37,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/src" "$PY" deploy-custom/custom34_server
   --ckpt "$CKPT" \
   --device cuda:0 \
   --num-inference-steps 10 \
+  --review-dir ./custom34_reviews \
   --code-log-dir ./custom34_code_logs \
   --host 0.0.0.0 --port 8765
 ```
@@ -67,9 +70,9 @@ curl -f http://127.0.0.1:8765/health
 
 ```bash
 PY=/usr/local/bin/python3.11
-PKG=/tmp/custom34-deployment-v3
-curl -fL 'https://github.com/youku-vip/agentic-wam/raw/refs/heads/codex/custom-data-review-files/deliveries/custom34-deployment-v3.zip' -o /tmp/custom34-deployment-v3.zip
-"$PY" -m zipfile -e /tmp/custom34-deployment-v3.zip "$PKG"
+PKG=/tmp/custom34-deployment-v4
+curl -fL 'https://github.com/youku-vip/agentic-wam/raw/refs/heads/codex/custom-data-review-files/deliveries/custom34-deployment-v4.zip' -o /tmp/custom34-deployment-v4.zip
+"$PY" -m zipfile -e /tmp/custom34-deployment-v4.zip "$PKG"
 "$PY" "$PKG/deploy-custom/install_custom34_deployment.py" --client-auto
 ```
 
@@ -141,4 +144,4 @@ curl -f -X DELETE http://127.0.0.1:8300/prompt
   --undo /实际备份路径/manifest.json
 ```
 
-回退前会检查安装后文件是否又被编辑；有后续编辑时拒绝覆盖。测试结果和运行命令见压缩包内 deploy-custom/DEPLOYMENT_V3_TESTING.md。已测试 CPU 转换、模拟 HTTP 和同步控制循环、配置/提示词与图像处理一致性；未在此环境加载你的 checkpoint、运行 CUDA 或连接机器人，不能据此保证实机抓取成功率。
+回退前会检查安装后文件是否又被编辑；有后续编辑时拒绝覆盖。测试结果和运行命令见压缩包内 deploy-custom/DEPLOYMENT_V4_TESTING.md。已测试 CPU 转换、模拟 HTTP 和同步控制循环、配置/提示词与图像处理一致性；未在此环境加载你的 checkpoint、运行 CUDA 或连接机器人，不能据此保证实机抓取成功率。

@@ -24,11 +24,13 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
 import traceback
 import uuid
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -286,6 +288,12 @@ class Custom34Runtime:
         if text_cache_dir:
             text_cache_dir = str(Path(str(text_cache_dir)).expanduser().resolve())
         self.text_mode = 'cache' if text_cache_dir else 'encoder'
+        self.review_dir = None if args.no_review else Path(args.review_dir).expanduser().resolve()
+        if self.review_dir is not None:
+            self.review_dir.mkdir(parents=True, exist_ok=True)
+        self.last_review = None
+        self.sample_stride = int(cfg.data.train.get('global_sample_stride', 1))
+        self.video_action_ratio = int(cfg.data.train.get('action_video_freq_ratio', 4))
         nf = int(cfg.data.train.num_frames)
         self.horizon = int(args.action_horizon or (nf - 1))
         if self.horizon != nf - 1:
@@ -304,6 +312,7 @@ class Custom34Runtime:
             seed=None, text_ckpt_dir=str(cfg.paths.text_encoder), text_max_len=128,
             n_cameras=3, num_video_frames=n_v, video_size=video_size,
             text_cache_dir=text_cache_dir, code_prompt_builder=code_prompt_builder,
+            capture_generated_video=self.review_dir is not None,
         )
         transforms = self.policy.processor.action_state_transforms
         custom = [t for t in transforms if isinstance(t, CustomUnifiedEEFTransform)]
@@ -336,6 +345,7 @@ class Custom34Runtime:
         LOG.info("camera order %s; chunk=%d; RTC server support=%s", self.cam_order, self.horizon, self.rtc_enabled)
         LOG.info('image=%s resize=%s scale_up=%s text=%s stats_sha256=%s', self.video_size,
                  self.image_resize_mode, self.image_letterbox_scale_up, self.text_mode, self.stats_sha256)
+        LOG.info('generated-image review directory=%s (one folder per inference)', self.review_dir)
         LOG.info('instance=%s code_objective=%s fast_joint=%s code_memory=%s history_modes=%s',
                  self.server_id, self.code_objective, self.fast_joint,
                  bool(getattr(self.policy.model, 'code_memory_enabled', False)), self.history_modes)
@@ -415,6 +425,12 @@ class Custom34Runtime:
         if not isinstance(instruction, str) or not instruction.strip():
             raise ValueError("instruction must be a nonempty English task string")
         state = check_state(body.get("state"))
+        reference = None
+        if 'reference' in body:
+            from agenticwam.utils.custom34_review import validate_reference
+            if getattr(self, 'review_dir', None) is None:
+                raise ValueError('reference comparison requires review capture; remove --no-review')
+            reference = validate_reference(body['reference'], self.horizon)
         imgs = body.get("images")
         if not isinstance(imgs, dict) or set(imgs) != set(ROLE_NAMES):
             raise ValueError("images must have exactly head, left, right")
@@ -426,6 +442,7 @@ class Custom34Runtime:
             "joint_action": {"vector": state.tolist()}}
         with self.lock:
             staged = False
+            self.last_review = None
             try:
                 if self._instruction is not None and self._instruction != instruction:
                     self._reset_episode_unlocked()
@@ -442,6 +459,13 @@ class Custom34Runtime:
                 self._instruction = instruction
                 if staged:
                     self.rtc_count += 1
+                if getattr(self, 'review_dir', None) is not None:
+                    try:
+                        self._save_review(body, frames, state, action20, predicted_delta64, code, reference)
+                    except Exception as exc:
+                        # Review I/O must not invalidate an already computed control target.
+                        LOG.error('Review export failed: %s', exc, exc_info=True)
+                        self.last_review = dict(self.last_review or {}, status='error', message=f'{type(exc).__name__}: {exc}')
                 # Log full newly generated code on EVERY inference, not only episode step 0.
                 try:
                     print(f"\n===== POLICY CODE | call={self.calls} episode={self.policy.episode_count} "
@@ -465,6 +489,32 @@ class Custom34Runtime:
                 self.policy.model._rtc_weights = None
         latency_ms = 1000.0 * (time.perf_counter() - start)
         return action20, latency_ms, code
+
+    def _save_review(self, body, images, state, action20, delta64, code, reference):
+        from agenticwam.utils.custom34_review import write_review
+        import torch
+        identifier = f'{self.server_id}/episode{self.policy.episode_count:06d}_call{self.calls:08d}'
+        output = self.review_dir / identifier
+        self.last_review = dict(status='writing', id=identifier, path=str(output),
+                                download_url=f'/reviews/{identifier}/bundle.zip',
+                                has_reference=reference is not None)
+        target64 = None
+        if reference is not None:
+            # This is the SAME anchor used to decode the prediction; ground truth is never model input.
+            target64 = self.transform._action64(torch.as_tensor(reference['action20'], dtype=torch.float32)[None],
+                                               torch.as_tensor(state, dtype=torch.float32)[None])[0].numpy()
+        metadata = dict(server_id=self.server_id, episode_count=self.policy.episode_count, call=self.calls,
+                        instruction=body['instruction'], request_id=body.get('request_id'), code=code,
+                        camera_order=list(self.cam_order), stats_sha256=self.stats_sha256,
+                        checkpoint=self.checkpoint, video_size=self.video_size,
+                        sample_stride=self.sample_stride, video_action_ratio=self.video_action_ratio,
+                        comparison_uses_reference_as_model_input=False)
+        write_review(output, raw_images=images, model_input=getattr(self.policy, '_last_obs_video', None),
+                     generated_video=getattr(self.policy, '_last_generated_video', None), camera_order=self.cam_order,
+                     state34=state, prediction20=action20, prediction64=delta64, metadata=metadata,
+                     reference=reference, target64=target64, video_step_stride=self.video_action_ratio*self.sample_stride)
+        self.last_review['status'] = 'saved'
+        LOG.info('REVIEW saved: %s (expert comparison=%s)', output, reference is not None)
 
     def reset(self) -> None:
         with self.lock:
@@ -495,6 +545,9 @@ def main():
     ap.add_argument("--fast-joint", action="store_true", help="install compiled-step joint inference")
     ap.add_argument("--rtc", action="store_true", help="accept optional committed/freeze fields")
     ap.add_argument("--code-log-dir", default=None)
+    ap.add_argument('--review-dir', default='./custom34_reviews',
+                    help='save generated camera PNGs and chunk arrays on EVERY /act; reference adds plots')
+    ap.add_argument('--no-review', action='store_true', help='disable generated-image capture and review I/O')
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--max-body-mb", type=int, default=24)
@@ -550,6 +603,28 @@ def main():
             return obj
 
         def do_GET(self):
+            if self.path.startswith('/reviews/'):
+                # Fixed-format IDs prevent reading arbitrary server files through this route.
+                match = re.fullmatch(r'/reviews/([a-f0-9]{32}/episode\d{6,}_call\d{8,})/bundle\.zip', self.path)
+                root = getattr(rt, 'review_dir', None)
+                if not match or root is None:
+                    return self.send_error_response(404, 'review bundle not found')
+                directory = Path(root) / match.group(1)
+                if not (directory / 'metadata.json').is_file():
+                    return self.send_error_response(404, 'review bundle not complete')
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+                    for file in sorted(directory.rglob('*')):
+                        if file.is_file() and not file.is_symlink():
+                            archive.write(file, file.relative_to(directory).as_posix())
+                raw = buffer.getvalue()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/zip')
+                self.send_header('Content-Length', str(len(raw)))
+                self.send_header('Content-Disposition', 'attachment; filename="custom34-review.zip"')
+                self.end_headers()
+                self.wfile.write(raw)
+                return
             if self.path != "/health":
                 return self.send_error_response(404, "GET /health only")
             self.send_json(200, {"status": "success", "state_dim": 34,
@@ -567,7 +642,12 @@ def main():
                                  'image_resize_mode': getattr(rt, 'image_resize_mode', None),
                                  'image_letterbox_scale_up': getattr(rt, 'image_letterbox_scale_up', None),
                                  'stats_sha256': getattr(rt, 'stats_sha256', None),
-                                 'text_mode': getattr(rt, 'text_mode', None)})
+                                 'text_mode': getattr(rt, 'text_mode', None),
+                                 'sample_stride': getattr(rt, 'sample_stride', 1),
+                                 'video_action_ratio': getattr(rt, 'video_action_ratio', 4),
+                                 'review_enabled': getattr(rt, 'review_dir', None) is not None,
+                                 'review_directory': str(rt.review_dir) if getattr(rt, 'review_dir', None) else None,
+                                 'last_review': getattr(rt, 'last_review', None)})
 
         def do_POST(self):
             t0 = time.perf_counter()
@@ -592,7 +672,8 @@ def main():
                 return self.send_json(200, {"status": "success", "action": action.tolist(),
                                             "latency": round(1000*(time.perf_counter()-t0), 2),
                                             "message": "", "server_id": rt.server_id,
-                                            "episode_count": rt.policy.episode_count})
+                                            "episode_count": rt.policy.episode_count,
+                                            'review': getattr(rt, 'last_review', None)})
             except (ValueError, KeyError, TypeError) as exc:
                 LOG.warning("invalid inference request: %s", exc)
                 return self.send_error_response(400, str(exc), 1000*(time.perf_counter()-t0))
