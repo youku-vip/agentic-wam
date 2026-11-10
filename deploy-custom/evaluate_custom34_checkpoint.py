@@ -24,7 +24,7 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'src'))
-TOOL_VERSION = '1.3'
+TOOL_VERSION = '1.4'
 
 
 def sha256(path):
@@ -221,6 +221,37 @@ def action_reference(actions, mask, fps, source):
     return validate_reference(dict(action20=actions, valid_mask=mask, fps=fps, source=source), len(actions))
 
 
+def evaluation_plans(single, reader, args, horizon, stride):
+    path = getattr(args, 'cases_file', None)
+    metadata = {}
+    if path is not None:
+        metadata = json.loads(Path(path).read_text())
+        records = metadata.get('cases') if isinstance(metadata, dict) else None
+        if not isinstance(records, list) or not records:
+            raise ValueError('cases file must contain a nonempty cases list')
+    else:
+        records = [dict(episode=ep, frame=frame) for ep in args.episodes for frame in args.start_frames]
+    plans, seen = [], set()
+    for record in records:
+        ep, start = record.get('episode'), record.get('frame')
+        if type(ep) is not int or type(start) is not int:
+            raise ValueError('case episode/frame must be integers')
+        if (ep, start) in seen:
+            raise ValueError(f'duplicate case episode={ep} frame={start}')
+        seen.add((ep, start))
+        slot = single.episodes.index(ep)
+        length = reader.episode_length(ep)
+        if not 0 <= start < length:
+            raise ValueError(f'episode {ep}: start frame {start} is out of range')
+        if start + (horizon - 1) * stride >= length and args.padding != 'repeat':
+            raise ValueError(f'episode {ep}, frame {start}: choose an earlier start or --padding repeat')
+        index = int(single._starts[slot]) + start
+        if record.get('global_index', index) != index:
+            raise ValueError('case enumeration differs from the actual training loader')
+        plans.append(dict(record, episode=ep, frame=start, global_index=index))
+    return plans, metadata
+
+
 def run(args):
     from hydra.utils import instantiate
     from omegaconf import OmegaConf
@@ -245,9 +276,11 @@ def run(args):
         raise RuntimeError('CUDA is unavailable; select an available GPU for real checkpoint inference')
     cfg.data.train.pretrained_norm_stats = str(stats.resolve())
     cfg.data.train.save_norm_stats = False
+    cfg.data.train.skip_padding_as_possible = False
     print('[checkpoint-eval] loading original training dataset; no statistics are written', flush=True)
     ds = instantiate(cfg.data.train)
     base = ds.lerobot_dataset
+    base.strict_sample_indices = True
     sources = base.multi_dataset._datasets
     if len(sources) != 1:
         raise ValueError('expected one custom v3 dataset root')
@@ -264,16 +297,12 @@ def run(args):
     cameras = [str(m['key']) for m in processor.shape_meta['images']]
     horizon = int(cfg.data.train.num_frames)-1
     stride = int(cfg.data.train.global_sample_stride)
-    plans = []
-    for episode in args.episodes:
-        slot = single.episodes.index(episode)
-        for start in args.start_frames:
-            length = reader.episode_length(episode)
-            if start < 0 or start >= length:
-                raise ValueError(f'episode {episode}: start frame {start} is out of range')
-            if start+(horizon-1)*stride >= length and args.padding != 'repeat':
-                raise ValueError(f'episode {episode}, frame {start}: choose an earlier start or --padding repeat')
-            plans.append((episode, start, int(single._starts[slot])+start))
+    plans, plan_metadata = evaluation_plans(single, reader, args, horizon, stride)
+    expected_cache = plan_metadata.get('code_cache_sha256')
+    if expected_cache and sha256(cfg.data.train.policy_code_idx_path) != expected_cache:
+        raise ValueError('case plan belongs to a different code cache')
+    if plan_metadata.get('root') and Path(plan_metadata['root']).resolve() != reader.root.resolve():
+        raise ValueError('case plan belongs to a different dataset root')
     precision = str(cfg.get('mixed_precision', 'bf16')).lower()
     dtype = {'bf16': torch.bfloat16, 'fp16': torch.float16, 'fp32': torch.float32, 'no': torch.float32}[precision]
     cfg.model.include_text_encoder = False
@@ -306,9 +335,13 @@ def run(args):
                         ('skill_prompt_sha256', cfg.data.train.get('skill_prompt_map'))]:
         if path:
             provenance[field] = sha256(str(path))
+    if getattr(args, 'cases_file', None) is not None:
+        provenance['cases_file_sha256'] = sha256(args.cases_file)
+        provenance['case_selection'] = 'explicit episode/frame plan; labels used for scoring only'
     (out/'run.json').write_text(json.dumps(provenance, indent=2)+'\n')
     results, failures = [], []
-    for episode, start, index in plans:
+    for plan in plans:
+        episode, start, index = plan['episode'], plan['frame'], plan['global_index']
         random.seed(42); np.random.seed(42); torch.manual_seed(42)
         sample = checked_sample(ds, recorder, index)
         batch = default_collate([sample])
@@ -327,6 +360,8 @@ def run(args):
         if max(state_error, action_error) > 1e-5:
             raise ValueError(f'training loader/raw-window mismatch: state={state_error}, action={action_error}')
         target = batch['policy_code'][0]
+        if plan.get('target_sha256') and hashlib.sha256(target.strip().encode()).hexdigest() != plan['target_sha256']:
+            raise ValueError(f'episode {episode}, frame {start}: stage plan and loader target disagree')
         for canvas in canvases:
             for steps in args.inference_steps:
                 for seed in args.seeds:
@@ -348,7 +383,11 @@ def run(args):
                         case.mkdir()
                         np.savez_compressed(case/'chunks.npz', state34=state.numpy(), pred_action20=pred20,
                                             pred_relative64=relative.numpy(), gt_action20=gt20,
-                                            gt_relative64=gt64.numpy(), valid_mask=valid)
+                                            gt_relative64=gt64.numpy(), valid_mask=valid,
+                                            sample_fps=np.asarray(reader.fps/stride),
+                                            action_frame_indices=rows)
+                        (case/'reference.json').write_text(json.dumps(dict(fps=reference['fps'], source=reference['source'],
+                            valid_steps=int(valid.sum()), horizon=horizon, stride=stride), indent=2)+'\n')
                         (case/'prediction.py').write_text(code+'\n')
                         (case/'target.py').write_text(target)
                         (case/'prompt.txt').write_text(prefix)
@@ -378,6 +417,8 @@ def run(args):
                                     input_fingerprints=dict(observation=tensor_fingerprint(obs), proprio=tensor_fingerprint(batch['proprio'][:, :1]),
                                                             prompt_embs=tensor_fingerprint(batch['prompt_embs'])),
                                     artifact_warnings=artifact_warnings, seconds=time.perf_counter()-started)
+                        item['case_selection'] = {k: v for k, v in plan.items()
+                                                  if k not in ('episode', 'frame', 'global_index')}
                         results.append(item)
                         with (out/'code_eval.jsonl').open('a') as f:
                             f.write(json.dumps(item, ensure_ascii=False, allow_nan=False)+'\n')
@@ -405,6 +446,7 @@ def main():
     p.add_argument('--stats', type=Path)
     p.add_argument('--episodes', type=int, nargs='+', default=[3])
     p.add_argument('--start-frames', type=int, nargs='+', default=[5])
+    p.add_argument('--cases-file', type=Path, help='Explicit episode/frame cases instead of the Cartesian episode/frame grid')
     p.add_argument('--inference-steps', type=int, nargs='+', default=[10])
     p.add_argument('--canvas-tokens', type=int, nargs='+')
     p.add_argument('--padding', choices=('error', 'repeat'), default='error')

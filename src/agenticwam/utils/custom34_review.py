@@ -190,10 +190,14 @@ def write_comparison_plots(output, prediction, reference, report, *, pred_relati
     xlabel = 'Time from observation (s)' if reference['fps'] is not None else 'Chunk step'
 
     def draw(ax, p, g, name):
-        ax.plot(x, g, color='tab:blue', label='Expert', linewidth=1.4)
-        ax.plot(x, p, color='tab:orange', label='Prediction', linewidth=1.3)
+        ax.plot(x, np.where(mask, g, np.nan), color='tab:blue', label='Expert', linewidth=1.4)
+        ax.plot(x, np.where(mask, p, np.nan), color='tab:orange', label='Prediction', linewidth=1.3)
         if (~mask).any():
-            ax.scatter(x[~mask], g[~mask], marker='x', color='gray', label='Padding (excluded)', s=13)
+            edges = np.diff(np.r_[False, ~mask, False].astype(np.int8))
+            step = x[1] - x[0] if len(x) > 1 else 1.0
+            for n, (begin, end) in enumerate(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))):
+                ax.axvspan(x[begin] - step/2, x[end-1] + step/2, color='gray', alpha=.15,
+                           label='Padding (excluded)' if n == 0 else None)
         ax.set_title(name, fontsize=8)
         ax.grid(alpha=.25)
 
