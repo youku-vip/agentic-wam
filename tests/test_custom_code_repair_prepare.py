@@ -78,6 +78,10 @@ class RepairPreparationTests(unittest.TestCase):
             self.assertFalse(cfg.save_optimizer_state)
             self.assertEqual(Path(cfg.data.train.pretrained_norm_stats).read_bytes(),(Path(folder)/'dataset_stats.json').read_bytes())
             subprocess.run(['bash','-n',str(args.out/'run_code_repair.sh')],check=True)
+            self.assertIn('export AGENTICWAM_MOT_NO_CKPT_EVERY=0',
+                          (args.out/'run_code_repair.sh').read_text())
+            self.assertIn('export AGENTICWAM_DISABLE_MOT_ATTN_CKPT=0',
+                          (args.out/'run_code_repair.sh').read_text())
             self.assertTrue(tool.audit(cfg,Tokenizer())['passed'])
             with self.assertRaises(FileExistsError):
                 tool.prepare(args,Tokenizer())

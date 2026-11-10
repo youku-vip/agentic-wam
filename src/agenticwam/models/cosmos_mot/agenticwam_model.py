@@ -718,29 +718,25 @@ class AgenticWAMCosmos(nn.Module):
                 code_out = self.code_expert.code_loss(code_logits, code_labels)
             _code_term = code_out["loss"]
             # RL HOOK (wd1-style reward-weighted MLE): when `_rl_weights` [B] is set, the code term
-            # becomes sum_g w_g * per-sample-CE_g instead of the mean. Same single cross_entropy op,
-            # so the autograd graph stays identical across ranks (DDP/ZeRO requirement).
-            # `_rl_weights` is None everywhere except the RL trainer -> default path byte-identical.
+            # becomes sum_g w_g * per-sample-CE_g instead of the mean. CE uses supervised
+            # rows in bounded FP32 chunks; even an unlabeled rank remains connected.
+            # `_rl_weights` is None everywhere except the RL trainer.
             _rlw = getattr(self, "_rl_weights", None)
             if _rlw is not None:
-                _lg = code_logits.float()
-                _ce = F.cross_entropy(_lg.reshape(-1, _lg.size(-1)), code_labels.reshape(-1),
-                                      ignore_index=-100, reduction="none").view(code_labels.shape)
+                _ce = self.code_expert.token_cross_entropy(code_logits, code_labels)
                 _vm = (code_labels != -100).to(_ce.dtype)
                 _c_ps = (_ce * _vm).sum(1) / _vm.sum(1).clamp(min=1.0)
                 _code_term = (_c_ps * _rlw.to(_c_ps.dtype)).sum()
                 # entropy bonus (RL-only, default 0): counteracts weighted-MLE's entropy contraction.
                 _ec = float(getattr(self, "_rl_ent_coef", 0.0) or 0.0)
                 if _ec > 0:
+                    _lg = code_logits.float()
                     _lp = _lg.log_softmax(-1)
                     _H = -(( _lp.exp() * _lp).sum(-1) * _vm).sum() / _vm.sum().clamp(min=1.0)
                     _code_term = _code_term - _ec * _H
             elif _rw_on and getattr(self.code_expert, "code_objective", "ar") in ("joint", "blockdiff"):
-                # per-sample CE (same single cross_entropy op -> autograd structure stays
-                # identical across ranks, which DDP/ZeRO requires); labels -100 = ignore.
-                _lg = code_logits.float()
-                _ce = F.cross_entropy(_lg.reshape(-1, _lg.size(-1)), code_labels.reshape(-1),
-                                      ignore_index=-100, reduction="none").view(code_labels.shape)
+                # Preserve the existing per-sample weighting, ignoring labels -100.
+                _ce = self.code_expert.token_cross_entropy(code_logits, code_labels)
                 _vm = (code_labels != -100).to(_ce.dtype)
                 _c_ps = (_ce * _vm).sum(1) / _vm.sum(1).clamp(min=1.0)                # [B]
                 _code_term = (_c_ps * w_cond.to(_c_ps.dtype)).mean()

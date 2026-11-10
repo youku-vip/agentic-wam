@@ -231,6 +231,8 @@ if [ -f src/agenticwam/utils/deepspeed_graph_count_cache.py ]; then
 fi
 export AGENTICWAM_PHASE_TIMING=0
 export AGENTICWAM_WAIT_DIAG_STEPS=0
+export AGENTICWAM_MOT_NO_CKPT_EVERY=0
+export AGENTICWAM_DISABLE_MOT_ATTN_CKPT=0
 MODE=audit
 if [ "$#" -gt 0 ]; then MODE="$1"; fi
 audit_run() {{

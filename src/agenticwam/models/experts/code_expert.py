@@ -256,35 +256,73 @@ class CodeExpert(nn.Module):
         """tokens: [B, S, D] -> logits [B, S, vocab]."""
         return self.lm_head(self.final_norm(tokens))
 
+    @staticmethod
+    def token_cross_entropy(logits: torch.Tensor, labels: torch.Tensor,
+                            chunk_tokens: int = 32) -> torch.Tensor:
+        """FP32 CE on supervised rows only, with bounded temporary vocabulary tensors.
+
+        Non-reentrant checkpointing recomputes the CE during backward instead of
+        retaining an FP32 log-softmax for every prompt/vision/canvas position.
+        Even an empty target traverses the logits graph and produces zero gradients.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        if logits.shape[:-1] != labels.shape:
+            raise ValueError("code logits and labels must have matching token shapes")
+        if chunk_tokens < 1:
+            raise ValueError("chunk_tokens must be positive")
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        flat_labels = labels.reshape(-1)
+        indices = (flat_labels != -100).nonzero(as_tuple=False).flatten()
+        selected_logits = flat_logits.index_select(0, indices)
+        selected_labels = flat_labels.index_select(0, indices)
+
+        def row_loss(source, target):
+            return F.cross_entropy(source.float(), target, reduction="none")
+
+        chunks = []
+        for start in range(0, max(1, indices.numel()), chunk_tokens):
+            source = selected_logits[start:start + chunk_tokens]
+            target = selected_labels[start:start + chunk_tokens]
+            if torch.is_grad_enabled() and source.requires_grad:
+                values = checkpoint(row_loss, source, target,
+                                    use_reentrant=False, preserve_rng_state=False)
+            else:
+                values = row_loss(source, target)
+            chunks.append(values)
+        values = torch.cat(chunks)
+        return torch.zeros_like(flat_labels, dtype=torch.float32).index_copy(
+            0, indices, values).reshape(labels.shape)
+
     def code_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> Dict[str, torch.Tensor]:
         """AR: causal-LM CE with shift. blockdiff: absorbing-diffusion CE at each token's OWN
         position (no shift), over masked code positions (label!=-100). labels==-100 ignored."""
         if getattr(self, "code_objective", "ar") in ("blockdiff", "joint"):
-            flat_logits = logits.reshape(-1, logits.size(-1)).float()
+            flat_logits = logits.reshape(-1, logits.size(-1))
             flat_labels = labels.reshape(-1)
         else:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            flat_logits = shift_logits.view(-1, shift_logits.size(-1)).float()
+            flat_logits = shift_logits.view(-1, shift_logits.size(-1))
             flat_labels = shift_labels.view(-1)
         # reduction="sum"/valid-count (not "mean") so an all-masked sample (code-coverage
         # ablation: an instruction with no GT code) yields a finite 0 loss instead of NaN,
         # while keeping the CE op in the graph on EVERY rank. This lets the caller compute
-        # code_loss unconditionally -> identical autograd structure across ranks -> DDP/ZeRO
-        # gradient collectives stay in sync regardless of per-rank code coverage.
-        import os as _os
+        # code_loss unconditionally -> the same parameters participate on every rank,
+        # including a rank without supervised tokens.
+        token_ce = self.token_cross_entropy(flat_logits, flat_labels)
         _ew = float(self._training_setting("pad_eos_weight", "AGENTICWAM_PAD_EOS_WEIGHT", 1.0))
         _eid = getattr(self.tokenizer, "eos_token_id", None)
         if _ew != 1.0 and _eid is not None:
             # EOS-downweighted CE (weight is an env constant -> identical autograd structure
             # on every rank, so DDP/ZeRO collectives stay in sync). Weighted-mean denominator.
-            _ce = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100, reduction="none")
+            _ce = token_ce
             _w = torch.ones_like(_ce)
             _w[flat_labels == _eid] = _ew
             _w[flat_labels == -100] = 0.0
             loss = (_ce * _w).sum() / _w.sum().clamp(min=1e-6)
         else:
-            loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=-100, reduction="sum") / (flat_labels != -100).sum().clamp(min=1)
+            loss = token_ce.sum() / (flat_labels != -100).sum().clamp(min=1)
         with torch.no_grad():
             valid = flat_labels != -100
             if valid.any():
