@@ -21,17 +21,22 @@ def verify(dataset, batch_size=4, world_size=2, grad_accum=8, steps=3, seed=42):
     shards = [iter(BatchSamplerShard(BatchSampler(sampler, batch_size, drop_last=False),
                                     num_processes=world_size, process_index=rank,
                                     split_batches=False, even_batches=True)) for rank in range(world_size)]
-    expected = {task: sampler.per_task_local for task in range(sampler.num_tasks)}
+    expected = ({task: sampler.per_task_local for task in range(sampler.num_tasks)}
+                if sampler.balance_scope == 'local' else None)
+    expected_global = {task: sampler.per_task_global for task in range(sampler.num_tasks)}
     updates, update_counts = [], Counter()
     for microstep in range(count):
-        global_indices = []
+        global_indices, global_counts = [], Counter()
         for shard in shards:
             batch = next(shard)
             actual = Counter(int(index.task_ids[item]) for item in batch)
-            if actual != expected:
+            if expected is not None and actual != expected:
                 raise AssertionError(f"Unbalanced rank-local batch: {actual}")
             global_indices.extend(batch)
             update_counts.update(actual)
+            global_counts.update(actual)
+        if global_counts != expected_global:
+            raise AssertionError(f"Unbalanced global microbatch: {global_counts}")
         if len(global_indices) != len(set(global_indices)):
             raise AssertionError("Duplicate sample across ranks in a global microbatch")
         if (microstep + 1) % grad_accum == 0:
@@ -47,7 +52,8 @@ def verify(dataset, batch_size=4, world_size=2, grad_accum=8, steps=3, seed=42):
     raw = index.counts()
     return dict(passed=True, task_names=dict(enumerate(index.task_names)), raw_frame_counts=raw,
                 raw_frame_fractions=[value / len(dataset) for value in raw],
-                checked_microbatches_per_rank=count, expected_per_rank_microbatch=expected,
+                checked_microbatches_per_rank=count, balance_scope=sampler.balance_scope,
+                expected_per_rank_microbatch=expected, expected_global_microbatch=expected_global,
                 observed_optimizer_batch_counts=updates, resume_prefix_check_passed=True,
                 sampler=sampler.descriptor(),
                 notes=["Reads selected Parquet task/episode/frame columns only; no video, normalizer or model is loaded.",

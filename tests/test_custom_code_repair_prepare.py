@@ -110,6 +110,17 @@ class RepairPreparationTests(unittest.TestCase):
                 tool.prepare(args,Tokenizer())
             self.assertFalse(args.out.exists())
 
+    def test_prepare_accepts_global_task_balance_with_two_samples_per_rank(self):
+        with tempfile.TemporaryDirectory() as folder:
+            args=self.fixture(folder)
+            cfg=OmegaConf.load(args.source_config)
+            cfg.batch_size=2
+            cfg.gradient_accumulation_steps=16
+            OmegaConf.save(cfg,args.source_config)
+            report=tool.prepare(args,Tokenizer())
+            self.assertEqual(report['effective_batch'],64)
+            self.assertEqual(report['expected_samples_per_task_per_update'],16)
+
 
 if __name__=='__main__':
     unittest.main()

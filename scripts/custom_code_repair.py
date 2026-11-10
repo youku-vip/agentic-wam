@@ -291,8 +291,8 @@ def prepare(args, tokenizer=None):
     cfg.task_balanced_batch = True
     cfg.wandb.name = out.name
     cfg.wandb.group = 'custom-code-repair-pilot'
-    if int(cfg.batch_size) % 4:
-        raise ValueError('rank-local batch_size must be a multiple of four')
+    if int(cfg.batch_size) < 1 or int(cfg.batch_size) * int(args.nproc) % 4:
+        raise ValueError('global microbatch (batch_size * nproc) must be a positive multiple of four')
     stats = args.stats or source.with_name('dataset_stats.json')
     if args.stats is not None and not stats.is_file():
         raise FileNotFoundError(stats)

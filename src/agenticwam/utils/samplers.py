@@ -42,7 +42,7 @@ class ResumableEpochSampler(Sampler[int]):
 
 
 class TaskBalancedEpochSampler(ResumableEpochSampler):
-    """Emit full balanced LOCAL batches; Accelerate shards these batches once.
+    """Balance local batches when possible, otherwise the global microbatch.
 
     A logical global microbatch comprises num_processes consecutive local
     batches. Per-task draws are disjoint across that global microbatch. Smaller
@@ -63,10 +63,12 @@ class TaskBalancedEpochSampler(ResumableEpochSampler):
             raise ValueError("Task IDs must cover every named task and be dense from zero")
         if self.gradient_accumulation_steps < 1:
             raise ValueError("Gradient accumulation steps must be positive")
-        if self.batch_size % self.num_tasks:
-            raise ValueError(f"Per-GPU batch_size={self.batch_size} must be divisible by task count={self.num_tasks}")
-        self.per_task_local = self.batch_size // self.num_tasks
-        self.per_task_global = self.per_task_local * self.num_processes
+        global_size = self.batch_size * self.num_processes
+        if global_size % self.num_tasks:
+            raise ValueError(f"Global microbatch={global_size} must be divisible by task count={self.num_tasks}")
+        self.balance_scope = "local" if self.batch_size % self.num_tasks == 0 else "global"
+        self.per_task_local = self.batch_size // self.num_tasks if self.balance_scope == "local" else None
+        self.per_task_global = global_size // self.num_tasks
         self.groups = [torch.as_tensor(np.flatnonzero(task_index.task_ids == task), dtype=torch.long)
                        for task in range(self.num_tasks)]
         if any(len(group) < self.per_task_global for group in self.groups):
@@ -76,10 +78,13 @@ class TaskBalancedEpochSampler(ResumableEpochSampler):
         self.epoch_samples = self.global_batches * self.batch_size * self.num_processes
 
     def descriptor(self):
-        return dict(kind="task_balanced_v1", seed=self.seed, batch_size=self.batch_size,
+        result = dict(kind="task_balanced_v1", seed=self.seed, batch_size=self.batch_size,
                     world_size=self.num_processes, epoch_samples=self.epoch_samples,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     task_names=list(self.task_names), task_index_sha256=self.task_index.sha256)
+        if self.balance_scope != "local":
+            result["balance_scope"] = "global_microbatch_v1"
+        return result
 
     def __iter__(self):
         generator = torch.Generator(device="cpu")
@@ -97,8 +102,15 @@ class TaskBalancedEpochSampler(ResumableEpochSampler):
                 draws.append(pools[task][start:start + self.per_task_global])
                 positions[task] += self.per_task_global
             for rank_slot in range(self.num_processes):
-                start = rank_slot * self.per_task_local
-                batch = torch.cat([draw[start:start + self.per_task_local] for draw in draws])
+                if self.balance_scope == "local":
+                    start = rank_slot * self.per_task_local
+                    batch = torch.cat([draw[start:start + self.per_task_local] for draw in draws])
+                else:
+                    # Rotate task groups between ranks; keep exactly equal global
+                    # counts and consume the same RNG on resume, including skips.
+                    slot = (rank_slot + global_batch) % self.num_processes
+                    start = slot * self.batch_size
+                    batch = torch.cat(draws)[start:start + self.batch_size]
                 batch = batch[torch.randperm(self.batch_size, generator=generator)]
                 # Consume RNG for skipped batches too, so a resumed run has the
                 # exact same remaining sequence as an uninterrupted run.

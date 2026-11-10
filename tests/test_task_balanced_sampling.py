@@ -111,7 +111,7 @@ class BalancedSamplerTests(unittest.TestCase):
 
     def test_incompatible_batch_and_insufficient_samples_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
-            self.sampler(batch=6)
+            self.sampler(batch=1, world=2)
         with self.assertRaisesRegex(ValueError, "distinct samples"):
             self.sampler(index=toy_index((1, 5, 6, 7)))
         self.assertEqual(len(list(self.sampler(batch=8, world=3, accum=2))) % 48, 0)

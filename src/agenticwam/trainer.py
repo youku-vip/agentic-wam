@@ -255,9 +255,10 @@ class AgenticWAMTrainer:
                 dataset, task_index, self.seed, self.batch_size, self.accelerator.num_processes,
                 self.gradient_accumulation_steps)
             dataset.enable_task_balanced_sampling(task_index)
-            logger.info("[task-balance] enabled tasks=%s raw_frame_counts=%s local_quota=%d epoch_samples=%d",
+            logger.info("[task-balance] enabled tasks=%s raw_frame_counts=%s balance_scope=%s local_quota=%s global_quota=%d epoch_samples=%d",
                         dict(enumerate(task_index.task_names)), task_index.counts(),
-                        self.train_sampler.per_task_local, self.train_sampler.epoch_samples)
+                        self.train_sampler.balance_scope, self.train_sampler.per_task_local,
+                        self.train_sampler.per_task_global, self.train_sampler.epoch_samples)
         else:
             self.train_sampler = ResumableEpochSampler(
                 dataset=dataset, seed=self.seed, batch_size=self.batch_size,

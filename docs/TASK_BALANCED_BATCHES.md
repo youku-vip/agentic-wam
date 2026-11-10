@@ -35,7 +35,7 @@ export AGENTICWAM_TASK_BALANCED_BATCH=1
 bash train.sh
 ```
 
-新源码在下次启动生效。每卡 batch_size 必须能被实际任务数整除，例如四任务使用 4、8、12；不满足时会直接报错。也可在训练命令中使用 `++task_balanced_batch=true`，显式配置优先于环境变量；无需替换现场 YAML。
+新源码在下次启动生效。每卡 batch_size 能被实际任务数整除时，保持每卡微批次均衡，例如四任务使用 4、8、12。显存较小时也支持两卡各 batch_size=2：两卡合计每个微批次四任务各 1 个，任务组在卡之间轮换；此时每卡单个微批次不包含全部四任务。要求 batch_size × world_size 能被实际任务数整除，否则直接报错。可在训练命令中使用 `++task_balanced_batch=true`，显式配置优先于环境变量。现有 Custom34 修复试验的配套命令见 [CUSTOM_CODE_REPAIR_BS2.md](CUSTOM_CODE_REPAIR_BS2.md)。
 
 此功能与 ZeRO-1 参数扫描缓存、视频稀疏读取相互独立，沿用之前已验证的环境即可。若更换为已包含官方扫描修复的 DeepSpeed（官方 v0.18.7 已包含 [PR #7886](https://github.com/deepspeedai/DeepSpeed/pull/7886)），单独验证兼容性并关闭 `AGENTICWAM_CACHE_DS_GRAPH_COUNTS`；本次均衡采样不会替换 DeepSpeed。
 
