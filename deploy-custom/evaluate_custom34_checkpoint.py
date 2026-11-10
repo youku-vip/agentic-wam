@@ -24,7 +24,7 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / 'src'))
-TOOL_VERSION = '1.2'
+TOOL_VERSION = '1.3'
 
 
 def sha256(path):
@@ -313,7 +313,7 @@ def run(args):
         sample = checked_sample(ds, recorder, index)
         batch = default_collate([sample])
         raw = reader.read_episode(episode, columns=['observation.state', 'action', 'task_index'])
-        state = torch.as_tensor(np.asarray(raw.iloc[start]['observation.state'], dtype=np.float32))
+        state = torch.from_numpy(np.array(raw.iloc[start]['observation.state'], dtype=np.float32, copy=True))
         rows = start+np.arange(horizon)*stride
         valid = rows < len(raw)
         gt20 = np.stack(raw.iloc[np.minimum(rows, len(raw)-1)]['action']).astype(np.float32)

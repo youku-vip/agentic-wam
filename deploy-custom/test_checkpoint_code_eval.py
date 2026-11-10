@@ -170,7 +170,7 @@ class CheckpointEvalTests(unittest.TestCase):
 
 
 @contextmanager
-def full_pipeline_fixture(module=tool, *, start=5, plots=True):
+def full_pipeline_fixture(module=tool, *, start=5, plots=True, mixed=False, readonly=False):
     """Real conversion, normalization, metrics, PNGs and plots; model/data source are CPU fakes."""
     import pandas as pd
     from omegaconf import OmegaConf
@@ -200,7 +200,15 @@ def full_pipeline_fixture(module=tool, *, start=5, plots=True):
         class Reader:
             fps = 10
             def episode_length(self, episode): return len(frame)
-            def read_episode(self, episode, columns=None): return frame.copy()
+            def read_episode(self, episode, columns=None):
+                result = frame.copy()
+                if readonly:
+                    def immutable(value):
+                        value = value.copy()
+                        value.setflags(write=False)
+                        return value
+                    result['observation.state'] = result['observation.state'].map(immutable)
+                return result
         reader = Reader(); reader.root = root
         single = SimpleNamespace(episodes=[0], _starts=[0], meta=SimpleNamespace(reader=reader))
         class Base:
@@ -227,6 +235,9 @@ def full_pipeline_fixture(module=tool, *, start=5, plots=True):
             n_cameras = 3
             def __init__(self):
                 super().__init__(); self.anchor = torch.nn.Parameter(torch.zeros(1))
+                if mixed:
+                    self.dtype_probe = torch.nn.Sequential(
+                        torch.nn.Linear(4, 4), torch.nn.Linear(4, 4).bfloat16())
                 self.video_scheduler = SimpleNamespace(sigmas=torch.tensor([1.,0.]))
                 self.action_scheduler = SimpleNamespace(sigmas=torch.tensor([1.,0.]))
                 self.code_expert = SimpleNamespace(tokenizer=Tokenizer(), max_code_tokens=512)
@@ -236,6 +247,8 @@ def full_pipeline_fixture(module=tool, *, start=5, plots=True):
             def _resolve_infer_code_tokens(self): return 256
             def infer_action_trimodal(self, **kw):
                 assert kw['return_video'] is False
+                if mixed:
+                    self.dtype_probe(torch.ones(1, 4, dtype=self.anchor.dtype, device=self.device))
                 return target_action.clone(), TARGET
         model = CheckpointModel()
         checkpoint = root/'weights.pt'
@@ -258,6 +271,19 @@ def full_pipeline_fixture(module=tool, *, start=5, plots=True):
 
 
 class FullReportTests(unittest.TestCase):
+    def test_mixed_checkpoint_and_readonly_state_complete_report(self):
+        with full_pipeline_fixture(plots=False, mixed=True, readonly=True) as (module, args):
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter('always')
+                self.assertEqual(module.run(args), 0)
+            self.assertFalse(any('not writable' in str(w.message) for w in caught))
+            summary = json.loads((args.out/'summary.json').read_text())
+            self.assertEqual(summary['completed'], 1)
+            self.assertEqual(summary['failures'], [])
+            profile = summary['provenance']['model_precision_profile']
+            self.assertEqual(set(profile['before']['parameters']), {'torch.float32', 'torch.bfloat16'})
+            self.assertEqual(set(profile['after']['parameters']), {'torch.bfloat16'})
+
     def test_full_pipeline_exports_metrics_inputs_arrays_and_plots(self):
         with full_pipeline_fixture() as (module, args):
             self.assertEqual(module.run(args), 0)

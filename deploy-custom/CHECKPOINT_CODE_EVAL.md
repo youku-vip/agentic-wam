@@ -16,6 +16,14 @@ v1/v1.1 曾把专家动作和有效掩码转成 Python list 后直接交给要�
 
 新增完整控制流程的 CPU 集成验证：使用模拟的数据源和模型，通过真实动作转换、归一化、指标、图片和全部对比图导出。也验证尾部补齐排除和绘图失败不丢弃数值评测。这不等同于在用户 GPU 上运行真实模型。
 
+## v1.3 只读状态与旧版本迁移
+
+从 Parquet 得到的 state 可能是只读 NumPy 视图。v1.3 在转成 PyTorch tensor 前显式复制，避免只读数组警告，数值不变。
+
+若新环境恢复了旧 v1 基础评测文件，即使专家代码对照包装器已是 v1.1，也仍会遇到 FP32/BF16 混用；修复精度后还可能遇到旧 reference 的 list 类型错误。迁移时只替换基础 `evaluate_custom34_checkpoint.py`，保留现有专家代码包装器。新基础脚本包含浮点精度统一、reference 数组校验、只读 state 复制和完整失败堆栈。
+
+CPU 集成检查覆盖了混合 FP32/BF16 线性层 checkpoint 的真实矩阵乘法，以及只读 state 输入、动作转换、指标和完整报告保存。另用原始 v1 基础脚本复现了精度失败和 list 指标失败，再验证三处手动修复后与专家代码对照包装器配合完成报告。测试模型和数据源仍为 CPU 模拟对象。
+
 ## 安装
 
 将 `deploy-custom/evaluate_custom34_checkpoint.py` 放到同名目录。其他训练/服务端文件不需要替换；依赖当前项目已有的模型、数据读取、CustomUnifiedEEFTransform 和 custom34_review 模块。
