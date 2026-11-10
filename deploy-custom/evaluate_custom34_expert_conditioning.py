@@ -8,10 +8,33 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
+import math
 import os
 from pathlib import Path
 import sys
 import types
+
+
+def prepare_code_rope(model, mode, theta):
+    """Inspect or rebuild only the nonpersistent cache, after model dtype setup."""
+    import torch
+    old = model.code_expert.freqs
+    audit = dict(mode=mode, theta=theta, status='verified',
+                 before_dtype=str(old.dtype), before_complex=old.is_complex(),
+                 rebuilt=False, quantized_cosine_matches=None,
+                 timing='after checkpoint load and evaluator precision setup')
+    if mode == 'complex' and not old.is_complex():
+        from agenticwam.models.experts.wan_video_dit import precompute_freqs_cis
+        fresh = precompute_freqs_cis(old.shape[1]*2, end=old.shape[0], theta=theta).to(old.device)
+        matches = torch.equal(old, fresh.real.to(old.dtype))
+        if not matches:
+            raise ValueError('RoPE cosine mismatch; verify AGENTICWAM_EVAL_CODE_ROPE_THETA')
+        model.code_expert.freqs = fresh
+        audit.update(rebuilt=True, quantized_cosine_matches=True)
+    audit.update(after_dtype=str(model.code_expert.freqs.dtype),
+                 after_complex=model.code_expert.freqs.is_complex())
+    return audit
 
 
 def build_probe(evaluator: Path, expert_code_file: Path):
@@ -23,17 +46,22 @@ def build_probe(evaluator: Path, expert_code_file: Path):
         raise ValueError('unset AGENTICWAM_ORACLE_CODE_FILE; pass --expert-code-file instead')
     if int(os.environ.get('AGENTICWAM_REMASK_ROUNDS', '0')) != 0:
         raise ValueError('expert conditioning requires AGENTICWAM_REMASK_ROUNDS=0')
+    rope_mode = os.environ.get('AGENTICWAM_EVAL_CODE_ROPE', 'original')
+    if rope_mode not in ('original', 'complex'):
+        raise ValueError('AGENTICWAM_EVAL_CODE_ROPE must be original or complex')
+    rope_theta = float(os.environ.get('AGENTICWAM_EVAL_CODE_ROPE_THETA', '1000000'))
+    if not math.isfinite(rope_theta) or rope_theta <= 0:
+        raise ValueError('AGENTICWAM_EVAL_CODE_ROPE_THETA must be finite and positive')
     source = evaluator.read_text()
-    if (os.environ.get('AGENTICWAM_EVAL_CODE_ROPE') == 'complex'
-            and 'code_rope_info = dict(mode=rope_mode' not in source):
-        raise ValueError('install the RoPE ablation in the evaluator before selecting complex mode')
     anchor = 'provenance = dict('
     if source.count(anchor) != 1:
         raise ValueError('unrecognized evaluator provenance; original file is not changed')
+    rope_audit = dict(mode=rope_mode, theta=rope_theta, status='not_run')
     audit = dict(code_conditioning='provided expert code', code_generation_evaluated=False,
                  expert_code_file=str(expert_code_file),
                  expert_code_sha256=hashlib.sha256(expert_code_file.read_bytes()).hexdigest(),
-                 probe='expert-conditioning-v1; compare physical action metrics only')
+                 code_rope_probe_audit=rope_audit,
+                 probe='expert-conditioning-v1.1; compare physical action metrics only')
     source = source.replace(anchor, 'provenance = dict(**_expert_conditioning_audit, ', 1)
     source = source.replace(
         'offline checkpoint generation through training loader; not historical training logs',
@@ -46,8 +74,10 @@ def build_probe(evaluator: Path, expert_code_file: Path):
         raise ValueError('expert code has invalid syntax')
     module.robot_calls(expert)
     original_infer, original_metrics = module.infer_once, module.code_metrics
+    rope_model = None
 
     def conditioned_infer(model, batch, *, steps, canvas, seed):
+        nonlocal rope_model
         if getattr(model.code_expert, 'code_objective', None) != 'joint':
             raise ValueError('this probe requires the joint code objective')
         if batch['policy_code'][0].strip() != expert:
@@ -55,6 +85,12 @@ def build_probe(evaluator: Path, expert_code_file: Path):
         tokens = model.code_expert.tokenizer.encode(expert, add_special_tokens=False)
         if len(tokens) + 1 > canvas:
             raise ValueError('expert code plus EOS does not fit the code canvas')
+        if rope_model is not model:
+            rope_audit.update(prepare_code_rope(model, rope_mode, rope_theta))
+            rope_model = model
+            print('[expert-conditioning] code RoPE:', json.dumps(rope_audit), flush=True)
+        if rope_mode == 'complex' and not model.code_expert.freqs.is_complex():
+            raise ValueError('code RoPE cache became real after preparation')
         previous = os.environ.get('AGENTICWAM_ORACLE_CODE_FILE')
         os.environ['AGENTICWAM_ORACLE_CODE_FILE'] = str(expert_code_file)
         try:
@@ -64,6 +100,9 @@ def build_probe(evaluator: Path, expert_code_file: Path):
                 os.environ.pop('AGENTICWAM_ORACLE_CODE_FILE', None)
             else:
                 os.environ['AGENTICWAM_ORACLE_CODE_FILE'] = previous
+        rope_audit['after_inference_complex'] = model.code_expert.freqs.is_complex()
+        if rope_mode == 'complex' and not rope_audit['after_inference_complex']:
+            raise ValueError('code RoPE cache became real during inference')
         if module.ast_tree(result[1]) != module.ast_tree(expert):
             raise ValueError('inference did not preserve the supplied expert program')
         return result
@@ -79,6 +118,20 @@ def build_probe(evaluator: Path, expert_code_file: Path):
         return result
 
     module.infer_once, module.code_metrics = conditioned_infer, provided_metrics
+    original_run = module.run
+
+    def run_with_final_audit(args):
+        result = original_run(args)
+        # The evaluator creates a fresh output directory; existing runs are rejected.
+        # Update the launch metadata after the runtime cache check has completed.
+        path = args.out.resolve() / 'run.json'
+        if path.is_file():
+            metadata = json.loads(path.read_text())
+            metadata['code_rope_probe_audit'] = dict(rope_audit)
+            path.write_text(json.dumps(metadata, indent=2, allow_nan=False)+'\n')
+        return result
+
+    module.run = run_with_final_audit
     return module
 
 
