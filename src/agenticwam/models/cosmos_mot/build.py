@@ -67,6 +67,8 @@ def build_agenticwam_cosmos(
     code_block_length: int = 4,
     max_code_tokens: int = 512,           # cap on (instruction prompt + code) tokens; batches pad
     code_canvas: int = 0,                 # TRAINING fixed code canvas (0 = batch-max alignment, legacy)
+    code_rope_mode: Optional[str] = None,
+    code_training_options: Optional[dict] = None,
     infer_code_tokens: Optional[int] = None,   # INFERENCE-only code canvas (code tokens only); None -> max_code_tokens
                                           # to the batch max capped by this, so it is a truncation
                                           # bound, not a fixed canvas.
@@ -126,6 +128,8 @@ def build_agenticwam_cosmos(
             block_length=code_block_length,
             max_code_tokens=max_code_tokens,
             code_canvas=code_canvas,
+            code_rope_mode=code_rope_mode,
+            code_training_options=code_training_options,
             device=device,
             torch_dtype=dtype,
         )
@@ -217,6 +221,8 @@ def create_agenticwam_cosmos(
     code_block_length: int = 4,
     max_code_tokens: int = 512,
     code_canvas: int = 0,                      # training fixed code canvas; 0 = batch-max (legacy)
+    code_rope_mode: Optional[str] = None,
+    code_training_options: Optional[dict] = None,
     infer_code_tokens: Optional[int] = None,   # inference-only code canvas; None -> max_code_tokens
     code_vision: str = "none",               # "none" | "qwen3vl_prefix" (frozen ViT + trainable merger -> 210-token code prefix)
     code_vision_path: str = "/path/to/Qwen3-VL-2B-Instruct",
@@ -260,6 +266,8 @@ def create_agenticwam_cosmos(
         code_block_length=code_block_length,
         max_code_tokens=max_code_tokens,
         code_canvas=code_canvas,
+        code_rope_mode=code_rope_mode,
+        code_training_options=code_training_options,
         infer_code_tokens=infer_code_tokens,
         use_code_expert=use_code_expert,
         include_text_encoder=include_text_encoder,

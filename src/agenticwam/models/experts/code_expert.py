@@ -23,6 +23,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import math
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -137,7 +140,9 @@ class CodeExpert(nn.Module):
         code_objective: str = "ar",
         code_block_length: int = 4,
         mask_token_id: Optional[int] = None,
-        code_canvas: int = 0,     # >0: FIXED code canvas (EOS-filled, fully supervised); 0 = batch-max (legacy)
+        code_canvas: int = 0,     # >0: fixed canvas; training options select legacy EOS or masked tail
+        code_rope_mode: Optional[str] = None,
+        code_training_options: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.blocks = blocks
@@ -154,6 +159,14 @@ class CodeExpert(nn.Module):
         self.attn_head_dim = attn_head_dim
         self.vocab_size = vocab_size
         self.max_code_tokens = int(max_code_tokens)
+        self.code_rope_mode = os.environ.get("AGENTICWAM_CODE_ROPE_MODE", code_rope_mode or "legacy")
+        if self.code_rope_mode not in ("legacy", "complex"):
+            raise ValueError("AGENTICWAM_CODE_ROPE_MODE must be legacy or complex")
+        self.rope_theta = float(rope_theta)
+        self.code_training_options = dict(code_training_options or {})
+        unknown = set(self.code_training_options)-{'canvas_tail', 'mask_tmin', 'mask_fullp', 'pad_eos_window', 'pad_eos_weight'}
+        if unknown:
+            raise ValueError(f"unknown code training options: {sorted(unknown)}")
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.tokenizer = tokenizer
         self.freeze_backbone = bool(freeze_backbone)
@@ -161,10 +174,8 @@ class CodeExpert(nn.Module):
         self.code_objective = str(code_objective)
         self.code_block_length = int(code_block_length)
         self.mask_token_id = mask_token_id
-        # FIXED CODE CANVAS (0 = off -> legacy batch-max alignment, byte-identical). When >0 the code
-        # region of every sample is exactly this many positions: program + EOS, EOS-filled to the
-        # canvas, with labels on ALL of them. Matches the inference geometry (an all-<MASK> canvas of
-        # AGENTICWAM_INFER_CODE_TOKENS positions), which batch-max alignment never showed the model.
+        # Legacy fixed canvases are EOS-filled and fully supervised. The opt-in masked tail
+        # keeps the same canvas geometry with bounded EOS labels and unsupervised MASK slots.
         self.code_canvas = int(code_canvas or 0)
         # RoPE cache for the code positions (1D causal sequence).
         self.register_buffer(
@@ -182,6 +193,25 @@ class CodeExpert(nn.Module):
         )
         nn.init.zeros_(self.time_embed[-1].weight)
         nn.init.zeros_(self.time_embed[-1].bias)
+
+    def _apply(self, fn, recurse=True):
+        """Opt-in cache protection for parent and factory dtype/device conversions."""
+        if self.code_rope_mode != "complex" or "freqs" not in self._buffers:
+            return super()._apply(fn, recurse=recurse)
+        rope = self._buffers.pop("freqs")
+        restored = rope
+        try:
+            if not rope.is_complex():
+                raise RuntimeError("complex code RoPE mode received a real cache")
+            result = super()._apply(fn, recurse=recurse)
+            destination = fn(rope.real).device
+            restored = rope.to(device=destination)
+            return result
+        finally:
+            self._buffers["freqs"] = restored
+
+    def _training_setting(self, key, environment, default):
+        return os.environ.get(environment, self.code_training_options.get(key, default))
 
     # --- MoT-facing methods --------------------------------------------------
     def compute_t_mod(self, timestep: torch.Tensor) -> torch.Tensor:
@@ -204,6 +234,8 @@ class CodeExpert(nn.Module):
         """input_ids: [B, S] long. Returns tokens/freqs/t_mod (neutral)/context(None)."""
         if input_ids.ndim != 2:
             raise ValueError(f"`input_ids` must be 2D [B, S], got {tuple(input_ids.shape)}")
+        if self.code_rope_mode == "complex" and not self.freqs.is_complex():
+            raise RuntimeError("code RoPE cache lost its imaginary component before forward")
         b, s = input_ids.shape
         if s > self.freqs.shape[0]:
             raise ValueError(f"code seq len {s} exceeds RoPE cache {self.freqs.shape[0]}")
@@ -241,7 +273,7 @@ class CodeExpert(nn.Module):
         # code_loss unconditionally -> identical autograd structure across ranks -> DDP/ZeRO
         # gradient collectives stay in sync regardless of per-rank code coverage.
         import os as _os
-        _ew = float(_os.environ.get("AGENTICWAM_PAD_EOS_WEIGHT", "1.0") or 1.0)
+        _ew = float(self._training_setting("pad_eos_weight", "AGENTICWAM_PAD_EOS_WEIGHT", 1.0))
         _eid = getattr(self.tokenizer, "eos_token_id", None)
         if _ew != 1.0 and _eid is not None:
             # EOS-downweighted CE (weight is an env constant -> identical autograd structure
@@ -261,7 +293,7 @@ class CodeExpert(nn.Module):
             else:
                 acc = torch.zeros((), device=logits.device)
         out = {"loss": loss, "acc": acc}
-        if _eid is not None and (_ew != 1.0 or int(_os.environ.get("AGENTICWAM_PAD_EOS_WINDOW", "0") or 0) > 0
+        if _eid is not None and (_ew != 1.0 or int(self._training_setting("pad_eos_window", "AGENTICWAM_PAD_EOS_WINDOW", 0)) > 0
                                  or int(getattr(self, "code_canvas", 0) or 0) > 0):
             # comparability metric: acc over non-EOS labels (EOS-window tokens are easy and
             # would inflate code_acc vs the historical curves)
@@ -323,15 +355,26 @@ class CodeExpert(nn.Module):
         # "program end -> EOS run" boundary for length control WITHOUT full-tail EOS padding,
         # under which EOS becomes the majority label and confidence-ordered decode floods the
         # canvas with high-confidence EOS before content is committed.
-        _pew = int(_os.environ.get("AGENTICWAM_PAD_EOS_WINDOW", "0") or 0)
+        _pew = int(self._training_setting("pad_eos_window", "AGENTICWAM_PAD_EOS_WINDOW", 0))
         if _pew > 0 and not getattr(self, "_pad_eos_logged", False):
             self._pad_eos_logged = True
-            print(f"[code-pad-eos] ACTIVE window={_pew} weight={_os.environ.get('AGENTICWAM_PAD_EOS_WEIGHT', '1.0')}", flush=True)
+            print(f"[code-pad-eos] ACTIVE window={_pew} weight={self._training_setting('pad_eos_weight', 'AGENTICWAM_PAD_EOS_WEIGHT', 1.0)}", flush=True)
         # FIXED CANVAS: config `code_canvas`, overridable by AGENTICWAM_CODE_CANVAS for ablations.
         _cv = int(_os.environ.get("AGENTICWAM_CODE_CANVAS", getattr(self, "code_canvas", 0)) or 0)
+        _tail = self._training_setting("canvas_tail", "AGENTICWAM_CODE_CANVAS_TAIL", "legacy")
+        if _tail not in ("legacy", "masked"):
+            raise ValueError("AGENTICWAM_CODE_CANVAS_TAIL must be legacy or masked")
+        if _tail == "masked":
+            if self.code_objective != "joint" or _cv <= 0:
+                raise ValueError("masked canvas tail requires joint objective and positive code_canvas")
+            if self.mask_token_id is None or eos_id is None or _pew < 0:
+                raise ValueError("masked canvas tail requires MASK/EOS tokens and a nonnegative EOS window")
         if _cv > 0 and not getattr(self, "_canvas_logged", False):
             self._canvas_logged = True
-            print(f"[code-canvas] ACTIVE fixed canvas={_cv}, EOS-filled, labels on the whole canvas", flush=True)
+            if _tail == "masked":
+                print(f"[code-canvas] ACTIVE fixed canvas={_cv}, MASK tail, bounded EOS window={_pew}", flush=True)
+            else:
+                print(f"[code-canvas] ACTIVE fixed canvas={_cv}, EOS-filled, labels on the whole canvas", flush=True)
         seqs, labs = [], []
         for i in range(bsz):
             if _noinstr:
@@ -344,6 +387,20 @@ class CodeExpert(nn.Module):
                     ptxt = f"# Instruction: {ptxt}\n"
                 p_ids = _enc(ptxt)
             c_ids = _enc(codes[i])
+            if _tail == "masked":
+                if len(p_ids) + _cv > max_length:
+                    raise ValueError(f"prompt {len(p_ids)} + code canvas {_cv} exceeds training cap {max_length}")
+                if c_ids and len(c_ids) + 1 > _cv:
+                    raise ValueError(f"code {len(c_ids)} + EOS exceeds code canvas {_cv}; refusing truncation")
+                supervised = []
+                if c_ids:
+                    supervised = c_ids + [eos_id] * min(1 + _pew, _cv-len(c_ids))
+                tail_size = _cv - len(supervised)
+                ids = p_ids + supervised + [self.mask_token_id] * tail_size
+                lab = [-100] * len(p_ids) + supervised + [-100] * tail_size
+                seqs.append(ids)
+                labs.append(lab)
+                continue
             if _cv > 0 and c_ids:
                 # program + terminal EOS, then EOS-filled to exactly _cv. Truncate to _cv-1 first so
                 # the terminal EOS survives even if a program ever outgrows the canvas.
@@ -410,8 +467,11 @@ class CodeExpert(nn.Module):
         #   AGENTICWAM_CODE_MASK_TMIN  in [0,1): t ~ U(t_min, 1.0)
         #   AGENTICWAM_CODE_MASK_FULLP in [0,1]: with this prob, t = 1.0 exactly
         import os as _os
-        _tmin = float(_os.environ.get("AGENTICWAM_CODE_MASK_TMIN", "0.0"))
-        _fullp = float(_os.environ.get("AGENTICWAM_CODE_MASK_FULLP", "0.0"))
+        _tmin = float(self._training_setting("mask_tmin", "AGENTICWAM_CODE_MASK_TMIN", 0.0))
+        _fullp = float(self._training_setting("mask_fullp", "AGENTICWAM_CODE_MASK_FULLP", 0.0))
+        if (not math.isfinite(_tmin) or not 0 <= _tmin < 1
+                or not math.isfinite(_fullp) or not 0 <= _fullp <= 1):
+            raise ValueError("code mask TMIN must be in [0,1) and FULLP in [0,1]")
         if not getattr(self, "_mask_curriculum_logged", False):
             self._mask_curriculum_logged = True
             if _tmin > 0.0 or _fullp > 0.0:
@@ -510,6 +570,8 @@ def _build_mock_code_expert(
     vocab_size: int = ByteTokenizer.vocab_size,
     max_code_tokens: int = 512,
     use_gradient_checkpointing: bool = False,
+    code_rope_mode: Optional[str] = None,
+    code_training_options: Optional[Dict[str, Any]] = None,
 ) -> CodeExpert:
     blocks = nn.ModuleList(
         [
@@ -538,6 +600,8 @@ def _build_mock_code_expert(
         max_code_tokens=max_code_tokens,
         use_gradient_checkpointing=use_gradient_checkpointing,
         tokenizer=ByteTokenizer(),
+        code_rope_mode=code_rope_mode,
+        code_training_options=code_training_options,
     )
     return expert
 
@@ -557,6 +621,8 @@ def _build_qwen_code_expert(
     device: str,
     torch_dtype: torch.dtype,
     interp_init_attn: bool = True,
+    code_rope_mode: Optional[str] = None,
+    code_training_options: Optional[Dict[str, Any]] = None,
 ) -> CodeExpert:
     from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
@@ -620,6 +686,8 @@ def _build_qwen_code_expert(
         rope_theta=rope_theta,
         tokenizer=tokenizer,
         freeze_backbone=freeze_backbone,
+        code_rope_mode=code_rope_mode,
+        code_training_options=code_training_options,
     )
 
     # Freeze the pretrained Qwen body (base-layer norms + FFN + embeddings + lm_head);
@@ -676,6 +744,8 @@ def _build_sdar_code_expert(
     objective: str = "blockdiff",
     device: str = "cuda",
     torch_dtype: torch.dtype = torch.bfloat16,
+    code_rope_mode: Optional[str] = None,
+    code_training_options: Optional[Dict[str, Any]] = None,
 ) -> CodeExpert:
     """Block-DIFFUSION code expert from an SDAR-1.7B checkpoint (Qwen3-1.7B body, block-diffusion
     pretrained). Architecturally identical to the Qwen3-VL LM slot (28L/2048/16H/128d/8KV/6144),
@@ -717,7 +787,8 @@ def _build_sdar_code_expert(
         vocab_size=vocab_size, max_code_tokens=max_code_tokens, rope_theta=rope_theta,
         tokenizer=tokenizer, freeze_backbone=freeze_backbone,
         code_objective=objective, code_block_length=block_length, mask_token_id=mask_id,
-        code_canvas=code_canvas)
+        code_canvas=code_canvas, code_rope_mode=code_rope_mode,
+        code_training_options=code_training_options)
     expert.set_backbone_frozen(freeze_backbone)
     del model
     logger.info("SDAR code expert: %d layers, hidden=%d, vocab=%d, mask_id=%s",
@@ -741,6 +812,8 @@ def build_code_expert(
     mock_hidden_dim: int = 256,
     objective: str = "ar",
     block_length: int = 4,
+    code_rope_mode: Optional[str] = None,
+    code_training_options: Optional[Dict[str, Any]] = None,
 ) -> CodeExpert:
     """Factory. `model_name="mock"` -> tiny offline expert; else a Qwen3-VL-bodied expert.
 
@@ -754,6 +827,7 @@ def build_code_expert(
             attn_head_dim=attn_head_dim, n_extra_layers=n_extra_layers,
             max_code_tokens=max_code_tokens, code_canvas=code_canvas, freeze_backbone=freeze_backbone,
             block_length=block_length, objective=_obj, device=device, torch_dtype=torch_dtype,
+            code_rope_mode=code_rope_mode, code_training_options=code_training_options,
         )
     if model_name == "mock":
         return _build_mock_code_expert(
@@ -762,6 +836,8 @@ def build_code_expert(
             attn_head_dim=attn_head_dim,
             hidden_dim=mock_hidden_dim,
             max_code_tokens=max_code_tokens,
+            code_rope_mode=code_rope_mode,
+            code_training_options=code_training_options,
         ).to(device=device, dtype=torch_dtype)
     return _build_qwen_code_expert(
         model_name=model_name,
@@ -772,6 +848,8 @@ def build_code_expert(
         max_code_tokens=max_code_tokens,
         freeze_backbone=freeze_backbone,
         use_lora=use_lora,
+        code_rope_mode=code_rope_mode,
+        code_training_options=code_training_options,
         device=device,
         torch_dtype=torch_dtype,
     )
